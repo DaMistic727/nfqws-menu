@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.57"
+SCRIPT_VERSION="0.9.60"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5700,7 +5700,6 @@ _opkg_print_probe() {
     printf '%s (%s)' "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$OPKG_PROBE_SZ")"
   elif [ "${OPKG_PROBE_SZ:-0}" -gt 0 ] 2>/dev/null; then
     printf '%s (%s)' "${YELLOW}обрыв${NC}" "$(_opkg_fmt_sz "$OPKG_PROBE_SZ")"
-    OPKG_PROBE_TRUNC=1
   else
     printf '%s' "${RED}нет${NC}"
   fi
@@ -5800,8 +5799,8 @@ _opkg_bootstrap_https_deps() {
   return 0
 }
 
-# Параллельный probe: первый полный Packages.gz (+keendev) побеждает.
-# stderr — статус; stdout — base URL.
+# Параллельный probe: первый полный Packages.gz (+keendev) → OPKG_PROBE_WINNER.
+# НЕ через $(…): subshell при выходе ждёт фоновые curl → длинная пауза после «← выбран».
 _opkg_probe_mirrors_parallel() {
   local ap="$1" has_kd="$2" skip="$3"
   local dir="/tmp/opkg-par-$$" pids="" base i=0 winner="" sz ksz line
@@ -5810,14 +5809,16 @@ https://mirrors.bfsu.edu.cn/entware https://mirrors.nju.edu.cn/entware \
 https://mirrors.cqupt.edu.cn/entware https://entware.diversion.ch \
 https://sw.ext.io/entware"
 
+  OPKG_PROBE_WINNER=""
   mkdir -p "$dir" || return 1
+
   for base in $bases; do
     [ -n "$skip" ] && [ "$base" = "$skip" ] && continue
     i=$((i + 1))
     (
       _b="$base"; _ap="$ap"; _kd="$has_kd"; _d="$dir"; _i="$i"
       _dest="${_d}/${_i}.bin"; _meta="${_d}/${_i}.meta"
-      if ! _opkg_http_get "${_b}/${_ap}/Packages.gz" "$_dest" 5 25; then
+      if ! _opkg_http_get "${_b}/${_ap}/Packages.gz" "$_dest" 4 15; then
         echo "fail" > "$_meta"; exit 0
       fi
       _sz=$(wc -c < "$_dest" 2>/dev/null | tr -d ' \n')
@@ -5828,7 +5829,7 @@ https://sw.ext.io/entware"
       fi
       _ksz=0
       if [ "$_kd" = "1" ]; then
-        if _opkg_http_get "${_b}/${_ap}/keenetic/Packages.gz" "$_dest" 5 15; then
+        if _opkg_http_get "${_b}/${_ap}/keenetic/Packages.gz" "$_dest" 3 10; then
           _ksz=$(wc -c < "$_dest" 2>/dev/null | tr -d ' \n')
           case "$_ksz" in ''|*[!0-9]*) _ksz=0 ;; esac
           rm -f "$_dest"
@@ -5842,7 +5843,6 @@ https://sw.ext.io/entware"
     pids="$pids $!"
   done
 
-  # poll до 30 с
   _w=0
   while [ "$_w" -lt 30 ]; do
     for meta in "$dir"/*.meta; do
@@ -5868,29 +5868,22 @@ https://sw.ext.io/entware"
   done
 
   if [ -n "$winner" ]; then
-    printf '  %s/%s … %s (%s)' "$winner" "$ap" "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$sz")" >&2
+    printf '  %s/%s … %s (%s)' "$winner" "$ap" "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$sz")"
     [ "${ksz:-0}" -gt 0 ] 2>/dev/null && \
-      printf ' + keendev %s (%s)' "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$ksz")" >&2
-    printf ' %s\n' "${GREEN}← выбран${NC}" >&2
+      printf ' + keendev %s (%s)' "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$ksz")"
+    printf ' %s\n' "${GREEN}← выбран${NC}"
+    OPKG_PROBE_WINNER="$winner"
   fi
 
-  for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
-  for pid in $pids; do wait "$pid" 2>/dev/null || true; done
+  for pid in $pids; do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  # rm в фоне — не блокироваться на открытых файлах curl
+  rm -rf "$dir" 2>/dev/null &
 
-  # если никто не выиграл — кратко почему
-  if [ -z "$winner" ]; then
-    for meta in "$dir"/*.meta; do
-      [ -f "$meta" ] || continue
-      line=$(cat "$meta" 2>/dev/null)
-      case "$line" in
-        trunc\ *) OPKG_PROBE_TRUNC=1 ;;
-      esac
-    done
-  fi
-
-  rm -rf "$dir"
-  [ -n "$winner" ] && printf '%s\n' "$winner"
+  [ -n "$OPKG_PROBE_WINNER" ]
 }
+
 
 # Перезаписать src/gz entware (+keendev) в conf.
 _opkg_rewrite_conf() {
@@ -5961,7 +5954,6 @@ service_opkg_fix() {
 
   echo
   info "Проверка Packages.gz…"
-  OPKG_PROBE_TRUNC=0
 
   # 1) текущий — короткий timeout
   if [ -n "$cur_base" ]; then
@@ -5989,14 +5981,13 @@ service_opkg_fix() {
     fi
   fi
 
-  # 2) параллельные зеркала
+  # 2) параллельные зеркала (без $(…) — subshell ждёт фоновые curl)
   if [ -z "$ok_base" ]; then
     info "Параллельный подбор зеркала…"
-    ok_base=$(_opkg_probe_mirrors_parallel "$arch_path" "$has_keendev" "$cur_base")
+    OPKG_PROBE_WINNER=""
+    _opkg_probe_mirrors_parallel "$arch_path" "$has_keendev" "$cur_base" || true
+    ok_base="$OPKG_PROBE_WINNER"
   fi
-
-  [ "${OPKG_PROBE_TRUNC:-0}" = "1" ] && \
-    warn "Были обрывы загрузки (DPI на HTTPS?) — отброшены."
 
   if [ -z "$ok_base" ]; then
     error "Ни один репозиторий не ответил."
