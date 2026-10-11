@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.60"
+SCRIPT_VERSION="0.9.61"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5739,6 +5739,12 @@ _opkg_install_local_ipk() {
   ( cd "$dir" && opkg install "./$base" )
 }
 
+# Удалить хвосты bootstrap/probe в /tmp (в т.ч. от прошлых запусков)
+_opkg_tmp_cleanup() {
+  rm -f /tmp/opkg-boot-* /tmp/opkg-probe-* 2>/dev/null || true
+  rm -rf /tmp/opkg-par-* 2>/dev/null || true
+}
+
 # Bootstrap: wget-ssl первым (без него https:// в opkg = «not an http or ftp url»),
 # затем ca-certificates. Оба .ipk — curl с ok_base, install локально.
 _opkg_bootstrap_https_deps() {
@@ -5747,9 +5753,9 @@ _opkg_bootstrap_https_deps() {
   local fn dest sz pkg
 
   info "Bootstrap: wget-ssl → ca-certificates (curl + local opkg install)…"
-  rm -f "$gz" "$txt"
+  _opkg_tmp_cleanup
   if ! _opkg_http_get "${base}/${ap}/Packages.gz" "$gz" 5 30; then
-    error "Не скачать Packages.gz"; rm -f "$gz"; return 1
+    error "Не скачать Packages.gz"; _opkg_tmp_cleanup; return 1
   fi
   if command -v zcat >/dev/null 2>&1; then
     zcat "$gz" > "$txt" 2>/dev/null
@@ -5759,7 +5765,9 @@ _opkg_bootstrap_https_deps() {
     gunzip -c "$gz" > "$txt" 2>/dev/null || true
   fi
   rm -f "$gz"
-  [ -s "$txt" ] || { error "Не распаковать Packages.gz"; rm -f "$txt"; return 1; }
+  if [ ! -s "$txt" ]; then
+    error "Не распаковать Packages.gz"; _opkg_tmp_cleanup; return 1
+  fi
 
   # wget-ssl раньше ca-certificates: после него feed-HTTPS уже может работать
   for pkg in wget-ssl ca-certificates; do
@@ -5769,21 +5777,20 @@ _opkg_bootstrap_https_deps() {
       hit && $1=="Filename:" {print $2; exit}
     ' "$txt")
     if [ -z "$fn" ]; then
-      error "В Packages нет $pkg"; rm -f "$txt"; return 1
+      error "В Packages нет $pkg"; _opkg_tmp_cleanup; return 1
     fi
     dest="/tmp/opkg-boot-$$-$fn"
     info "  curl $fn …"
     if ! _opkg_http_get "${base}/${ap}/${fn}" "$dest" 5 60; then
-      error "  не скачать $fn"; rm -f "$dest" "$txt"; return 1
+      error "  не скачать $fn"; _opkg_tmp_cleanup; return 1
     fi
     sz=$(wc -c < "$dest" 2>/dev/null | tr -d ' \n')
     case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
     if [ "$sz" -lt 5000 ]; then
-      error "  $fn слишком мал ($sz Б)"; rm -f "$dest" "$txt"; return 1
+      error "  $fn слишком мал ($sz Б)"; _opkg_tmp_cleanup; return 1
     fi
     info "  opkg install ./$fn ($(_opkg_fmt_sz "$sz"))…"
     if ! _opkg_install_local_ipk "$dest"; then
-      # fallback: после wget-ssl можно поставить ca-certificates из feed
       if [ "$pkg" = "ca-certificates" ] && is_installed "wget-ssl" 2>/dev/null; then
         info "  fallback: opkg install ca-certificates (feed)…"
         opkg install ca-certificates 2>/dev/null || warn "  ca-certificates не встал"
@@ -5794,7 +5801,7 @@ _opkg_bootstrap_https_deps() {
     rm -f "$dest"
     refresh_opkg_cache 2>/dev/null || true
   done
-  rm -f "$txt"
+  _opkg_tmp_cleanup
   opkg remove wget-nossl 2>/dev/null || true
   return 0
 }
@@ -5914,6 +5921,7 @@ service_opkg_fix() {
 
   echo
   info "$LBL_S3"
+  _opkg_tmp_cleanup
 
   if [ ! -f "$conf" ]; then
     error "Не найден $conf — Entware не установлен?"
@@ -6049,6 +6057,7 @@ service_opkg_fix() {
     else
       info "OPKG исправлен ($ok_base)."
     fi
+    _opkg_tmp_cleanup
     return 0
   fi
   if [ "$conf_matches" = "1" ]; then
@@ -6057,6 +6066,7 @@ service_opkg_fix() {
     error "opkg update не удался после смены источника."
     [ -n "$bak" ] && [ -f "$bak" ] && { warn "Откат: $bak"; cp "$bak" "$conf" 2>/dev/null || true; }
   fi
+  _opkg_tmp_cleanup
   return 1
 }
 
