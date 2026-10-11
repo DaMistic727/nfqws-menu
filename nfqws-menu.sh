@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.41"
+SCRIPT_VERSION="0.9.46"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -106,6 +106,7 @@ ui_apply_lang() {
       LBL_REMOVE="СЕРВИС"
       LBL_S1="Сжать bin/sbin (UPX)"
       LBL_S2="Dropbear fix"
+      LBL_S3="Починить OPKG"
       LBL_U="Обновить все пакеты"
       LBL_1="Установка NFQWS / NFQWS2"
       LBL_3="Выбор стратегии"
@@ -151,6 +152,7 @@ ui_apply_lang() {
       LBL_REMOVE="SERVICE"
       LBL_S1="Compress bin/sbin (UPX)"
       LBL_S2="Dropbear fix"
+      LBL_S3="Fix OPKG"
       LBL_U="Upgrade all packages"
       LBL_1="Install NFQWS / NFQWS2"
       LBL_3="Select strategy"
@@ -5647,12 +5649,224 @@ service_dropbear_fix() {
   return 0
 }
 
+# Проверка репозитория: скачиваем Packages.gz ЦЕЛИКОМ.
+# $1=url  $2=min_bytes (по умолчанию 50000 — основной Entware ~300–400 КБ).
+# keendev/Packages.gz ~5 КБ → min=1000. DPI-обрыв HTTPS ~16 КБ отсекается
+# порогом 50 КБ на основном фиде; на keendev смотрим, что файл не пустой.
+_opkg_repo_probe() {
+  local url="$1" min="${2:-50000}" tmp="/tmp/opkg-probe-$$.gz" sz=0
+  case "$min" in ''|*[!0-9]*) min=50000 ;; esac
+  rm -f "$tmp"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 5 --max-time 25 -o "$tmp" "$url" 2>/dev/null || {
+      rm -f "$tmp"
+      return 1
+    }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 25 -O "$tmp" "$url" 2>/dev/null || {
+      rm -f "$tmp"
+      return 1
+    }
+  else
+    return 1
+  fi
+  sz=$(wc -c < "$tmp" 2>/dev/null | tr -d ' \n')
+  rm -f "$tmp"
+  case "$sz" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$sz" -gt "$min" ]
+}
+
+# Из URL src/gz вытащить arch-путь (mipselsf-k3.4 / aarch64-k3.10 / …).
+_opkg_arch_path_from_url() {
+  local u="$1" last prev
+  u="${u%/}"
+  last="${u##*/}"
+  if [ "$last" = "keenetic" ]; then
+    prev="${u%/*}"
+    printf '%s\n' "${prev##*/}"
+  else
+    printf '%s\n' "$last"
+  fi
+}
+
+# Fallback arch-path по ARCH (detect_arch).
+_opkg_arch_path_fallback() {
+  need_arch 2>/dev/null || true
+  case "$ARCH" in
+    mipsel)  echo "mipselsf-k3.4" ;;
+    mips)    echo "mipssf-k3.4" ;;
+    aarch64) echo "aarch64-k3.10" ;;
+    x86_64)  echo "x64-k3.2" ;;
+    x86)     echo "x86-k2.6" ;;
+    *)       echo "" ;;
+  esac
+}
+
+# 3. Починить OPKG: http→https, затем зеркала; перезапись /opt/etc/opkg.conf.
+service_opkg_fix() {
+  local conf="/opt/etc/opkg.conf"
+  local arch_path="" has_keendev=0 ok_base="" base pkg_url kd_url line url
+  local bak tmp changed=0
+
+  echo
+  info "$LBL_S3"
+
+  if [ ! -f "$conf" ]; then
+    error "Не найден $conf — Entware не установлен?"
+    return 1
+  fi
+
+  echo
+  info "Текущие репозитории:"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      src/gz*|src\ *) printf '  %s\n' "$line" ;;
+    esac
+  done < "$conf"
+
+  # arch-path из первого src/gz
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      src/gz\ *)
+        # src/gz name URL
+        url=$(printf '%s\n' "$line" | awk '{print $3}')
+        [ -n "$url" ] || continue
+        arch_path=$(_opkg_arch_path_from_url "$url")
+        [ -n "$arch_path" ] && break
+        ;;
+    esac
+  done < "$conf"
+
+  if [ -z "$arch_path" ]; then
+    arch_path=$(_opkg_arch_path_fallback)
+  fi
+  if [ -z "$arch_path" ]; then
+    error "Не удалось определить arch-путь (mipselsf-k3.4 / aarch64-k3.10 …)."
+    error "Проверьте src/gz в $conf"
+    return 1
+  fi
+  info "Arch-path: $arch_path"
+
+  grep -qE '^[[:space:]]*src/gz[[:space:]]+keendev[[:space:]]' "$conf" 2>/dev/null && has_keendev=1
+
+  echo
+  info "Проверка Packages.gz (полная загрузка, порог >50 КБ)…"
+  warn "DPI часто рвёт HTTPS ~на 16 КБ — такие источники будут отброшены."
+
+  # HTTP официальный раньше HTTPS: при DPI на TLS http://bin.entware.net чаще жив.
+  # Затем HTTPS официальный и полные зеркала Entware.
+  # sw.ext.io/entware — полное; sw.ext.io/ent — урезанное (~60 pkg), не использовать.
+  for base in \
+    "http://bin.entware.net" \
+    "https://bin.entware.net" \
+    "https://mirrors.bfsu.edu.cn/entware" \
+    "https://mirrors.nju.edu.cn/entware" \
+    "https://mirrors.cqupt.edu.cn/entware" \
+    "https://entware.diversion.ch" \
+    "https://sw.ext.io/entware"
+  do
+    pkg_url="${base}/${arch_path}/Packages.gz"
+    printf '  %s … ' "$pkg_url"
+    if ! _opkg_repo_probe "$pkg_url"; then
+      printf '%s\n' "${RED}нет${NC}"
+      continue
+    fi
+    printf '%s' "${GREEN}ok${NC}"
+
+    if [ "$has_keendev" = "1" ]; then
+      kd_url="${base}/${arch_path}/keenetic/Packages.gz"
+      printf ' + keendev … '
+      # keendev ~5 КБ (не 370 КБ) — порог 1000, иначе ложный fail
+      if ! _opkg_repo_probe "$kd_url" 1000; then
+        printf '%s\n' "${YELLOW}нет — пропуск${NC}"
+        continue
+      fi
+      printf '%s' "${GREEN}ok${NC}"
+    fi
+    printf '\n'
+    ok_base="$base"
+    break
+  done
+
+  if [ -z "$ok_base" ]; then
+    error "Ни один репозиторий не ответил. Проверьте интернет / DPI / DNS."
+    return 1
+  fi
+
+  # Уже совпадает с текущим conf?
+  if grep -qE "^[[:space:]]*src/gz[[:space:]]+entware[[:space:]]+${ok_base}/${arch_path}[[:space:]]*$" "$conf" 2>/dev/null; then
+    if [ "$has_keendev" != "1" ] || \
+       grep -qE "^[[:space:]]*src/gz[[:space:]]+keendev[[:space:]]+${ok_base}/${arch_path}/keenetic[[:space:]]*$" "$conf" 2>/dev/null; then
+      info "Конфиг уже указывает на рабочий источник: $ok_base"
+      info "opkg update …"
+      if opkg update; then
+        info "OPKG в порядке."
+        return 0
+      fi
+      warn "Источник отвечает, но opkg update упал — проверьте lists_dir / место на диске."
+      return 1
+    fi
+  fi
+
+  bak="${conf}.bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)"
+  cp "$conf" "$bak" 2>/dev/null && info "Бэкап: $bak" || true
+
+  tmp="${conf}.new.$$"
+  # Переписываем только src/gz entware / keendev; остальное без изменений
+  awk -v base="$ok_base" -v ap="$arch_path" -v kd="$has_keendev" '
+    BEGIN { done_e=0; done_k=0 }
+    $1=="src/gz" && $2=="entware" {
+      print "src/gz entware " base "/" ap
+      done_e=1
+      next
+    }
+    $1=="src/gz" && $2=="keendev" {
+      if (kd==1) {
+        print "src/gz keendev " base "/" ap "/keenetic"
+        done_k=1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!done_e) print "src/gz entware " base "/" ap
+      if (kd==1 && !done_k) print "src/gz keendev " base "/" ap "/keenetic"
+    }
+  ' "$conf" > "$tmp" || { error "Не удалось сформировать новый conf"; rm -f "$tmp"; return 1; }
+
+  if ! mv "$tmp" "$conf"; then
+    error "Не удалось записать $conf"
+    rm -f "$tmp"
+    return 1
+  fi
+  changed=1
+
+  echo
+  info "Записано в $conf:"
+  printf '  src/gz entware %s/%s\n' "$ok_base" "$arch_path"
+  [ "$has_keendev" = "1" ] && printf '  src/gz keendev %s/%s/keenetic\n' "$ok_base" "$arch_path"
+
+  echo
+  info "opkg update …"
+  if opkg update; then
+    info "OPKG исправлен ($ok_base)."
+    return 0
+  fi
+  error "opkg update не удался после смены источника."
+  if [ -f "$bak" ]; then
+    warn "Восстановление из бэкапа: $bak"
+    cp "$bak" "$conf" 2>/dev/null || true
+  fi
+  return 1
+}
+
 menu_service() {
   while true; do
     echo
     printf '%s\n' "${BOLD}${CYAN}[::]  ${LBL_REMOVE} (S)${NC}"
     echo "      1. $LBL_S1"
     echo "      2. $LBL_S2"
+    echo "      3. $LBL_S3"
     echo "      U. $LBL_U"
     echo "      0. ${LBL_BACK_ITEM}"
     echo
@@ -5661,6 +5875,7 @@ menu_service() {
     case "$schoice" in
       1) service_upx_compress || true ;;
       2) service_dropbear_fix || true ;;
+      3) service_opkg_fix || true ;;
       U|u) opkg_upgrade_all || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор." ;;
