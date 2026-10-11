@@ -4,7 +4,7 @@
 
 Репозиторий также служит хранилищем готовых **стратегий** обхода DPI, **blobs** и **lists**.
 
-- Скрипт: [`nfqws-menu.sh`](nfqws-menu.sh) (текущая версия **0.9.40**)
+- Скрипт: [`nfqws-menu.sh`](nfqws-menu.sh) (текущая версия **0.9.57**)
 - Стратегии: [`strategies/`](strategies/)
 - Hosts: [`hosts`](hosts)
 - Контрольные суммы: [`SHA256SUMS`](SHA256SUMS), [`strategies/blobs/SHA256SUMS`](strategies/blobs/SHA256SUMS)
@@ -29,16 +29,39 @@
 
 ## Быстрый старт
 
-Подключитесь к Entware (SSH, порт 222 или 22, логин `root`):
+Подключитесь к Entware (SSH, порт 222 или 22, логин `root`).
+
+> **Рекомендуется jsDelivr** — `raw.githubusercontent.com` у части провайдеров отвечает **404** (DPI), хотя файл в репозитории есть.
+
+### Установка через jsDelivr (предпочтительно)
 
 ```bash
-opkg update && opkg install curl libnghttp2 && curl -sSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/nfqws-menu.sh -o /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
+opkg update && opkg install curl wget-ssl
+wget -O /opt/nfqws-menu.sh https://cdn.jsdelivr.net/gh/rndnaame/nfqws-menu@main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
 ```
 
-или с wget:
+или curl:
+
+```bash
+curl -fsSL -o /opt/nfqws-menu.sh https://cdn.jsdelivr.net/gh/rndnaame/nfqws-menu@main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
+```
+
+Запасное зеркало (Fastly):
+
+```bash
+wget -O /opt/nfqws-menu.sh https://fastly.jsdelivr.net/gh/rndnaame/nfqws-menu@main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
+```
+
+### Установка с GitHub raw (если не режется)
 
 ```bash
 wget -O /opt/nfqws-menu.sh https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
+```
+
+или ghproxy:
+
+```bash
+wget -O /opt/nfqws-menu.sh https://ghproxy.net/https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
 ```
 
 После первого запуска создаётся symlink для быстрого старта:
