@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.46"
+SCRIPT_VERSION="0.9.51"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5650,11 +5650,11 @@ service_dropbear_fix() {
 }
 
 # Проверка репозитория: скачиваем Packages.gz ЦЕЛИКОМ.
-# $1=url  $2=min_bytes (по умолчанию 50000 — основной Entware ~300–400 КБ).
-# keendev/Packages.gz ~5 КБ → min=1000. DPI-обрыв HTTPS ~16 КБ отсекается
-# порогом 50 КБ на основном фиде; на keendev смотрим, что файл не пустой.
+# $1=url  $2=min_bytes (entware: 50000, keendev: 1000).
+# Пишет размер в OPKG_PROBE_SZ (байты). Код: 0=ok, 1=нет/обрыв.
 _opkg_repo_probe() {
   local url="$1" min="${2:-50000}" tmp="/tmp/opkg-probe-$$.gz" sz=0
+  OPKG_PROBE_SZ=0
   case "$min" in ''|*[!0-9]*) min=50000 ;; esac
   rm -f "$tmp"
   if command -v curl >/dev/null 2>&1; then
@@ -5673,7 +5673,35 @@ _opkg_repo_probe() {
   sz=$(wc -c < "$tmp" 2>/dev/null | tr -d ' \n')
   rm -f "$tmp"
   case "$sz" in ''|*[!0-9]*) return 1 ;; esac
+  OPKG_PROBE_SZ=$sz
   [ "$sz" -gt "$min" ]
+}
+
+# Человекочитаемый размер: 377242 → 368K
+_opkg_fmt_sz() {
+  local n="$1"
+  case "$n" in ''|*[!0-9]*) echo "?"; return ;; esac
+  if [ "$n" -ge 1048576 ]; then
+    echo "$((n / 1048576))M"
+  elif [ "$n" -ge 1024 ]; then
+    echo "$((n / 1024))K"
+  else
+    echo "${n}B"
+  fi
+}
+
+# Печать результата probe: ok (368K) / обрыв (16K) / нет
+_opkg_print_probe() {
+  local ok="$1" min="${2:-50000}"
+  if [ "$ok" = "1" ]; then
+    printf '%s (%s)' "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$OPKG_PROBE_SZ")"
+  elif [ "${OPKG_PROBE_SZ:-0}" -gt 0 ] 2>/dev/null; then
+    # что-то скачалось, но меньше порога — типичный DPI-обрыв
+    printf '%s (%s < %s)' "${YELLOW}обрыв${NC}" "$(_opkg_fmt_sz "$OPKG_PROBE_SZ")" "$(_opkg_fmt_sz "$min")"
+    OPKG_PROBE_TRUNC=1
+  else
+    printf '%s' "${RED}нет${NC}"
+  fi
 }
 
 # Из URL src/gz вытащить arch-путь (mipselsf-k3.4 / aarch64-k3.10 / …).
@@ -5702,11 +5730,97 @@ _opkg_arch_path_fallback() {
   esac
 }
 
+# Bootstrap ca-certificates + wget-ssl без рабочего opkg/HTTP:
+# качаем Packages.gz и .ipk через curl с уже проверенного base.
+_opkg_bootstrap_https_deps() {
+  local base="$1" ap="$2"
+  local pkg_gz="/tmp/opkg-boot-$$.Packages.gz"
+  local pkg_txt="/tmp/opkg-boot-$$.Packages"
+  local fn_ca="" fn_wssl="" dest sz
+  local url_ca url_wssl
+
+  info "Bootstrap HTTPS-deps с $base/$ap (curl → локальный opkg install)…"
+
+  rm -f "$pkg_gz" "$pkg_txt"
+  if ! curl -fsSL --connect-timeout 5 --max-time 30 -o "$pkg_gz" \
+      "${base}/${ap}/Packages.gz" 2>/dev/null; then
+    error "Не скачать Packages.gz для разбора имён пакетов."
+    rm -f "$pkg_gz"
+    return 1
+  fi
+
+  if command -v gzip >/dev/null 2>&1; then
+    gzip -dc "$pkg_gz" > "$pkg_txt" 2>/dev/null || zcat "$pkg_gz" > "$pkg_txt" 2>/dev/null
+  elif command -v zcat >/dev/null 2>&1; then
+    zcat "$pkg_gz" > "$pkg_txt" 2>/dev/null
+  else
+    # busybox gunzip -c
+    gunzip -c "$pkg_gz" > "$pkg_txt" 2>/dev/null || true
+  fi
+  rm -f "$pkg_gz"
+  if [ ! -s "$pkg_txt" ]; then
+    error "Не удалось распаковать Packages.gz"
+    rm -f "$pkg_txt"
+    return 1
+  fi
+
+  fn_ca=$(awk '
+    /^Package:[[:space:]]*ca-certificates$/ {p=1; next}
+    /^Package:/ {p=0}
+    p && /^Filename:[[:space:]]*/ { sub(/^Filename:[[:space:]]*/,""); print; exit }
+  ' "$pkg_txt")
+  fn_wssl=$(awk '
+    /^Package:[[:space:]]*wget-ssl$/ {p=1; next}
+    /^Package:/ {p=0}
+    p && /^Filename:[[:space:]]*/ { sub(/^Filename:[[:space:]]*/,""); print; exit }
+  ' "$pkg_txt")
+  rm -f "$pkg_txt"
+
+  if [ -z "$fn_ca" ] || [ -z "$fn_wssl" ]; then
+    error "В Packages нет ca-certificates и/или wget-ssl."
+    return 1
+  fi
+
+  url_ca="${base}/${ap}/${fn_ca}"
+  url_wssl="${base}/${ap}/${fn_wssl}"
+
+  for pair in "ca-certificates|$url_ca|$fn_ca" "wget-ssl|$url_wssl|$fn_wssl"; do
+    name=${pair%%|*}
+    rest=${pair#*|}
+    url=${rest%%|*}
+    fn=${rest#*|}
+    dest="/tmp/opkg-boot-$$-$fn"
+    info "  curl $fn …"
+    if ! curl -fsSL --connect-timeout 5 --max-time 60 -o "$dest" "$url" 2>/dev/null; then
+      error "  не скачать $fn"
+      rm -f "$dest"
+      return 1
+    fi
+    sz=$(wc -c < "$dest" 2>/dev/null | tr -d ' \n')
+    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    if [ "$sz" -lt 5000 ]; then
+      error "  $fn слишком мал ($sz Б) — обрыв/мусор"
+      rm -f "$dest"
+      return 1
+    fi
+    info "  opkg install $fn ($sz Б)…"
+    if ! opkg install "$dest" 2>/dev/null; then
+      # уже установлен / конфликт — пробуем force-reinstall
+      opkg install --force-reinstall "$dest" 2>/dev/null || \
+        warn "  opkg install $fn не удался"
+    fi
+    rm -f "$dest"
+  done
+
+  opkg remove wget-nossl 2>/dev/null || true
+  return 0
+}
+
 # 3. Починить OPKG: http→https, затем зеркала; перезапись /opt/etc/opkg.conf.
 service_opkg_fix() {
   local conf="/opt/etc/opkg.conf"
   local arch_path="" has_keendev=0 ok_base="" base pkg_url kd_url line url
-  local bak tmp changed=0
+  local bak tmp changed=0 need_ca=0 need_wssl=0 cur_base="" cur_ok=0 conf_matches=0
 
   echo
   info "$LBL_S3"
@@ -5749,63 +5863,147 @@ service_opkg_fix() {
 
   grep -qE '^[[:space:]]*src/gz[[:space:]]+keendev[[:space:]]' "$conf" 2>/dev/null && has_keendev=1
 
+  # Текущий base entware из conf (схема+хост+/path без arch)
+  cur_base=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      src/gz\ entware\ *|src/gz\ \ entware\ *)
+        url=$(printf '%s\n' "$line" | awk '{print $3}')
+        [ -n "$url" ] || continue
+        # http://host/arch → http://host  |  https://mirrors…/entware/arch → …/entware
+        cur_base=$(printf '%s\n' "$url" | sed "s|/${arch_path}/*$||")
+        break
+        ;;
+    esac
+  done < "$conf"
+
   echo
-  info "Проверка Packages.gz (полная загрузка, порог >50 КБ)…"
-  warn "DPI часто рвёт HTTPS ~на 16 КБ — такие источники будут отброшены."
+  info "Проверка Packages.gz (полная загрузка)…"
+  OPKG_PROBE_TRUNC=0
 
-  # HTTP официальный раньше HTTPS: при DPI на TLS http://bin.entware.net чаще жив.
-  # Затем HTTPS официальный и полные зеркала Entware.
-  # sw.ext.io/entware — полное; sw.ext.io/ent — урезанное (~60 pkg), не использовать.
-  for base in \
-    "http://bin.entware.net" \
-    "https://bin.entware.net" \
-    "https://mirrors.bfsu.edu.cn/entware" \
-    "https://mirrors.nju.edu.cn/entware" \
-    "https://mirrors.cqupt.edu.cn/entware" \
-    "https://entware.diversion.ch" \
-    "https://sw.ext.io/entware"
-  do
-    pkg_url="${base}/${arch_path}/Packages.gz"
-    printf '  %s … ' "$pkg_url"
-    if ! _opkg_repo_probe "$pkg_url"; then
-      printf '%s\n' "${RED}нет${NC}"
-      continue
+  # 1) Сначала текущий источник из conf — без лишнего перебора зеркал
+  if [ -n "$cur_base" ]; then
+    pkg_url="${cur_base}/${arch_path}/Packages.gz"
+    printf '  [текущий] %s … ' "$pkg_url"
+    if _opkg_repo_probe "$pkg_url" 50000; then
+      _opkg_print_probe 1 50000
+      cur_ok=1
+      if [ "$has_keendev" = "1" ]; then
+        kd_url="${cur_base}/${arch_path}/keenetic/Packages.gz"
+        printf ' + keendev … '
+        if _opkg_repo_probe "$kd_url" 1000; then
+          _opkg_print_probe 1 1000
+          printf '\n'
+          ok_base="$cur_base"
+        else
+          _opkg_print_probe 0 1000
+          printf ' — keendev недоступен, ищем другое…\n'
+          cur_ok=0
+        fi
+      else
+        printf '\n'
+        ok_base="$cur_base"
+      fi
+    else
+      _opkg_print_probe 0 50000
+      printf '\n'
     fi
-    printf '%s' "${GREEN}ok${NC}"
+  fi
 
-    if [ "$has_keendev" = "1" ]; then
-      kd_url="${base}/${arch_path}/keenetic/Packages.gz"
-      printf ' + keendev … '
-      # keendev ~5 КБ (не 370 КБ) — порог 1000, иначе ложный fail
-      if ! _opkg_repo_probe "$kd_url" 1000; then
-        printf '%s\n' "${YELLOW}нет — пропуск${NC}"
+  # 2) Если текущий не ок — перебор кандидатов
+  if [ -z "$ok_base" ]; then
+    info "Подбор рабочего зеркала…"
+    # HTTP официальный раньше HTTPS (DPI на TLS).
+    # sw.ext.io/entware — полное; /ent — урезанное, не использовать.
+    for base in \
+      "http://bin.entware.net" \
+      "https://bin.entware.net" \
+      "https://mirrors.bfsu.edu.cn/entware" \
+      "https://mirrors.nju.edu.cn/entware" \
+      "https://mirrors.cqupt.edu.cn/entware" \
+      "https://entware.diversion.ch" \
+      "https://sw.ext.io/entware"
+    do
+      # уже проверили как текущий
+      [ "$base" = "$cur_base" ] && continue
+      pkg_url="${base}/${arch_path}/Packages.gz"
+      printf '  %s … ' "$pkg_url"
+      if ! _opkg_repo_probe "$pkg_url" 50000; then
+        _opkg_print_probe 0 50000
+        printf '\n'
         continue
       fi
-      printf '%s' "${GREEN}ok${NC}"
-    fi
-    printf '\n'
-    ok_base="$base"
-    break
-  done
+      _opkg_print_probe 1 50000
+
+      if [ "$has_keendev" = "1" ]; then
+        kd_url="${base}/${arch_path}/keenetic/Packages.gz"
+        printf ' + keendev … '
+        if ! _opkg_repo_probe "$kd_url" 1000; then
+          _opkg_print_probe 0 1000
+          printf ' — пропуск\n'
+          continue
+        fi
+        _opkg_print_probe 1 1000
+      fi
+      printf '\n'
+      ok_base="$base"
+      break
+    done
+  fi
+
+  if [ "${OPKG_PROBE_TRUNC:-0}" = "1" ]; then
+    warn "Были обрывы загрузки (часто DPI на HTTPS ~16 КБ) — такие источники отброшены."
+  fi
 
   if [ -z "$ok_base" ]; then
     error "Ни один репозиторий не ответил. Проверьте интернет / DPI / DNS."
     return 1
   fi
 
-  # Уже совпадает с текущим conf?
+  conf_matches=0
   if grep -qE "^[[:space:]]*src/gz[[:space:]]+entware[[:space:]]+${ok_base}/${arch_path}[[:space:]]*$" "$conf" 2>/dev/null; then
     if [ "$has_keendev" != "1" ] || \
        grep -qE "^[[:space:]]*src/gz[[:space:]]+keendev[[:space:]]+${ok_base}/${arch_path}/keenetic[[:space:]]*$" "$conf" 2>/dev/null; then
-      info "Конфиг уже указывает на рабочий источник: $ok_base"
-      info "opkg update …"
-      if opkg update; then
-        info "OPKG в порядке."
-        return 0
-      fi
-      warn "Источник отвечает, но opkg update упал — проверьте lists_dir / место на диске."
-      return 1
+      conf_matches=1
     fi
+  fi
+
+  # HTTPS: opkg → wget → нужны ca-certificates + wget-ssl.
+  # Тихо, если уже стоят; bootstrap через curl, если нет.
+  case "$ok_base" in
+    https://*)
+      refresh_opkg_cache 2>/dev/null || true
+      need_ca=1
+      need_wssl=1
+      is_installed "ca-certificates" && need_ca=0
+      is_installed "wget-ssl" && need_wssl=0
+      if [ "$need_ca" = "1" ] || [ "$need_wssl" = "1" ]; then
+        echo
+        info "HTTPS: ставим ca-certificates / wget-ssl…"
+        _opkg_bootstrap_https_deps "$ok_base" "$arch_path" || true
+        refresh_opkg_cache 2>/dev/null || true
+        if ! is_installed "ca-certificates" || ! is_installed "wget-ssl"; then
+          warn "ca-certificates / wget-ssl не установлены — opkg update по HTTPS может упасть."
+        fi
+      fi
+      if is_installed "wget-nossl"; then
+        info "Удаляем wget-nossl (мешает HTTPS)…"
+        opkg remove wget-nossl 2>/dev/null || true
+        refresh_opkg_cache 2>/dev/null || true
+      fi
+      ;;
+  esac
+
+  # Conf уже на рабочем источнике — только opkg update
+  if [ "$conf_matches" = "1" ]; then
+    echo
+    info "opkg update ($ok_base)…"
+    if opkg update; then
+      info "OPKG в порядке."
+      return 0
+    fi
+    warn "Источник отвечает (curl), но opkg update упал — lists_dir / место / wget-ssl."
+    return 1
   fi
 
   bak="${conf}.bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)"
