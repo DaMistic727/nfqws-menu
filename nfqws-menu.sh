@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.61"
+SCRIPT_VERSION="0.9.63"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -690,11 +690,27 @@ run_menu_remote_sh() {
   run_remote_sh "$url" "$min_bytes"
 }
 
+# Убить чужие процессы opkg и снять lock (без ожидания).
+opkg_kill_others() {
+  local lock="/opt/tmp/opkg.lock" pids
+  pids=$(pgrep -x opkg 2>/dev/null || true)
+  if [ -z "$pids" ]; then
+    pids=$(pgrep -f '/opkg |^opkg ' 2>/dev/null || true)
+  fi
+  if [ -n "$pids" ]; then
+    warn "Останавливаем сторонний opkg: $pids"
+    # shellcheck disable=SC2086
+    kill -9 $pids 2>/dev/null || true
+  fi
+  rm -f "$lock" 2>/dev/null || true
+}
+
 # Записать opkg-репозиторий и обновить индекс
 ensure_opkg_repo() {
   local name="$1" url="$2"
   mkdir -p /opt/etc/opkg
   echo "src/gz $name $url" > "/opt/etc/opkg/${name}.conf"
+  opkg_kill_others
   opkg update
 }
 
@@ -1356,7 +1372,9 @@ nfqws_lists_dir() {
 # ---------------------------------------------------------------------------
 install_deps() {
   info "Установка зависимостей..."
+  opkg_kill_others
   opkg update
+  opkg_kill_others
   opkg install ca-certificates wget-ssl 2>/dev/null || true
   opkg remove wget-nossl 2>/dev/null || true
 }
@@ -6051,6 +6069,7 @@ service_opkg_fix() {
 
   echo
   info "opkg update ($ok_base)…"
+  opkg_kill_others
   if opkg update; then
     if [ "$conf_matches" = "1" ]; then
       info "OPKG в порядке."
