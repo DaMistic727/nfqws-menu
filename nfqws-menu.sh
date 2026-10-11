@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.51"
+SCRIPT_VERSION="0.9.57"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5649,27 +5649,35 @@ service_dropbear_fix() {
   return 0
 }
 
-# Проверка репозитория: скачиваем Packages.gz ЦЕЛИКОМ.
-# $1=url  $2=min_bytes (entware: 50000, keendev: 1000).
-# Пишет размер в OPKG_PROBE_SZ (байты). Код: 0=ok, 1=нет/обрыв.
-_opkg_repo_probe() {
-  local url="$1" min="${2:-50000}" tmp="/tmp/opkg-probe-$$.gz" sz=0
-  OPKG_PROBE_SZ=0
-  case "$min" in ''|*[!0-9]*) min=50000 ;; esac
-  rm -f "$tmp"
+# ---------------------------------------------------------------------------
+# 3. Починить OPKG
+# ---------------------------------------------------------------------------
+# Пороги: основной Packages.gz ~370К; keendev ~5К; DPI-обрыв HTTPS ~16К.
+OPKG_MIN_MAIN=50000
+OPKG_MIN_KD=1000
+
+# HTTP GET в файл. $1=url $2=dest $3=connect $4=max_time
+_opkg_http_get() {
+  local url="$1" dest="$2" conn="${3:-5}" maxt="${4:-25}"
+  rm -f "$dest"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 5 --max-time 25 -o "$tmp" "$url" 2>/dev/null || {
-      rm -f "$tmp"
-      return 1
-    }
+    curl -fsSL --connect-timeout "$conn" --max-time "$maxt" -o "$dest" "$url" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -T 25 -O "$tmp" "$url" 2>/dev/null || {
-      rm -f "$tmp"
-      return 1
-    }
+    wget -q -T "$maxt" -O "$dest" "$url" 2>/dev/null
   else
     return 1
   fi
+  [ -f "$dest" ] && [ -s "$dest" ]
+}
+
+# Полная загрузка Packages.gz. $1=url $2=min $3=max_time $4=connect
+# → OPKG_PROBE_SZ; 0=ok, 1=fail
+_opkg_repo_probe() {
+  local url="$1" min="${2:-$OPKG_MIN_MAIN}" maxt="${3:-25}" conn="${4:-5}"
+  local tmp="/tmp/opkg-probe-$$.gz" sz=0
+  OPKG_PROBE_SZ=0
+  case "$min" in ''|*[!0-9]*) min=$OPKG_MIN_MAIN ;; esac
+  _opkg_http_get "$url" "$tmp" "$conn" "$maxt" || return 1
   sz=$(wc -c < "$tmp" 2>/dev/null | tr -d ' \n')
   rm -f "$tmp"
   case "$sz" in ''|*[!0-9]*) return 1 ;; esac
@@ -5677,47 +5685,38 @@ _opkg_repo_probe() {
   [ "$sz" -gt "$min" ]
 }
 
-# Человекочитаемый размер: 377242 → 368K
 _opkg_fmt_sz() {
   local n="$1"
   case "$n" in ''|*[!0-9]*) echo "?"; return ;; esac
-  if [ "$n" -ge 1048576 ]; then
-    echo "$((n / 1048576))M"
-  elif [ "$n" -ge 1024 ]; then
-    echo "$((n / 1024))K"
-  else
-    echo "${n}B"
-  fi
+  if [ "$n" -ge 1048576 ]; then echo "$((n / 1048576))M"
+  elif [ "$n" -ge 1024 ]; then echo "$((n / 1024))K"
+  else echo "${n}B"; fi
 }
 
-# Печать результата probe: ok (368K) / обрыв (16K) / нет
+# ok (368K) / обрыв (16K) / нет
 _opkg_print_probe() {
-  local ok="$1" min="${2:-50000}"
+  local ok="$1" min="${2:-$OPKG_MIN_MAIN}"
   if [ "$ok" = "1" ]; then
     printf '%s (%s)' "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$OPKG_PROBE_SZ")"
   elif [ "${OPKG_PROBE_SZ:-0}" -gt 0 ] 2>/dev/null; then
-    # что-то скачалось, но меньше порога — типичный DPI-обрыв
-    printf '%s (%s < %s)' "${YELLOW}обрыв${NC}" "$(_opkg_fmt_sz "$OPKG_PROBE_SZ")" "$(_opkg_fmt_sz "$min")"
+    printf '%s (%s)' "${YELLOW}обрыв${NC}" "$(_opkg_fmt_sz "$OPKG_PROBE_SZ")"
     OPKG_PROBE_TRUNC=1
   else
     printf '%s' "${RED}нет${NC}"
   fi
 }
 
-# Из URL src/gz вытащить arch-путь (mipselsf-k3.4 / aarch64-k3.10 / …).
 _opkg_arch_path_from_url() {
-  local u="$1" last prev
-  u="${u%/}"
+  local u="${1%/}" last="${1%/}"
   last="${u##*/}"
   if [ "$last" = "keenetic" ]; then
-    prev="${u%/*}"
-    printf '%s\n' "${prev##*/}"
+    u="${u%/*}"
+    printf '%s\n' "${u##*/}"
   else
     printf '%s\n' "$last"
   fi
 }
 
-# Fallback arch-path по ARCH (detect_arch).
 _opkg_arch_path_fallback() {
   need_arch 2>/dev/null || true
   case "$ARCH" in
@@ -5730,97 +5729,195 @@ _opkg_arch_path_fallback() {
   esac
 }
 
-# Bootstrap ca-certificates + wget-ssl без рабочего opkg/HTTP:
-# качаем Packages.gz и .ipk через curl с уже проверенного base.
+# Установка .ipk строго с диска (opkg не должен ходить в feed).
+# --force-reinstall иногда заставляет Entware-opkg качать из src/gz — не используем.
+_opkg_install_local_ipk() {
+  local file="$1" dir base
+  [ -f "$file" ] && [ -s "$file" ] || return 1
+  dir=$(dirname "$file")
+  base=$(basename "$file")
+  # относительный путь из каталога файла — надёжнее на Entware
+  ( cd "$dir" && opkg install "./$base" )
+}
+
+# Bootstrap: wget-ssl первым (без него https:// в opkg = «not an http or ftp url»),
+# затем ca-certificates. Оба .ipk — curl с ok_base, install локально.
 _opkg_bootstrap_https_deps() {
   local base="$1" ap="$2"
-  local pkg_gz="/tmp/opkg-boot-$$.Packages.gz"
-  local pkg_txt="/tmp/opkg-boot-$$.Packages"
-  local fn_ca="" fn_wssl="" dest sz
-  local url_ca url_wssl
+  local gz="/tmp/opkg-boot-$$.gz" txt="/tmp/opkg-boot-$$.txt"
+  local fn dest sz pkg
 
-  info "Bootstrap HTTPS-deps с $base/$ap (curl → локальный opkg install)…"
-
-  rm -f "$pkg_gz" "$pkg_txt"
-  if ! curl -fsSL --connect-timeout 5 --max-time 30 -o "$pkg_gz" \
-      "${base}/${ap}/Packages.gz" 2>/dev/null; then
-    error "Не скачать Packages.gz для разбора имён пакетов."
-    rm -f "$pkg_gz"
-    return 1
+  info "Bootstrap: wget-ssl → ca-certificates (curl + local opkg install)…"
+  rm -f "$gz" "$txt"
+  if ! _opkg_http_get "${base}/${ap}/Packages.gz" "$gz" 5 30; then
+    error "Не скачать Packages.gz"; rm -f "$gz"; return 1
   fi
-
-  if command -v gzip >/dev/null 2>&1; then
-    gzip -dc "$pkg_gz" > "$pkg_txt" 2>/dev/null || zcat "$pkg_gz" > "$pkg_txt" 2>/dev/null
-  elif command -v zcat >/dev/null 2>&1; then
-    zcat "$pkg_gz" > "$pkg_txt" 2>/dev/null
+  if command -v zcat >/dev/null 2>&1; then
+    zcat "$gz" > "$txt" 2>/dev/null
+  elif command -v gzip >/dev/null 2>&1; then
+    gzip -dc "$gz" > "$txt" 2>/dev/null
   else
-    # busybox gunzip -c
-    gunzip -c "$pkg_gz" > "$pkg_txt" 2>/dev/null || true
+    gunzip -c "$gz" > "$txt" 2>/dev/null || true
   fi
-  rm -f "$pkg_gz"
-  if [ ! -s "$pkg_txt" ]; then
-    error "Не удалось распаковать Packages.gz"
-    rm -f "$pkg_txt"
-    return 1
-  fi
+  rm -f "$gz"
+  [ -s "$txt" ] || { error "Не распаковать Packages.gz"; rm -f "$txt"; return 1; }
 
-  fn_ca=$(awk '
-    /^Package:[[:space:]]*ca-certificates$/ {p=1; next}
-    /^Package:/ {p=0}
-    p && /^Filename:[[:space:]]*/ { sub(/^Filename:[[:space:]]*/,""); print; exit }
-  ' "$pkg_txt")
-  fn_wssl=$(awk '
-    /^Package:[[:space:]]*wget-ssl$/ {p=1; next}
-    /^Package:/ {p=0}
-    p && /^Filename:[[:space:]]*/ { sub(/^Filename:[[:space:]]*/,""); print; exit }
-  ' "$pkg_txt")
-  rm -f "$pkg_txt"
-
-  if [ -z "$fn_ca" ] || [ -z "$fn_wssl" ]; then
-    error "В Packages нет ca-certificates и/или wget-ssl."
-    return 1
-  fi
-
-  url_ca="${base}/${ap}/${fn_ca}"
-  url_wssl="${base}/${ap}/${fn_wssl}"
-
-  for pair in "ca-certificates|$url_ca|$fn_ca" "wget-ssl|$url_wssl|$fn_wssl"; do
-    name=${pair%%|*}
-    rest=${pair#*|}
-    url=${rest%%|*}
-    fn=${rest#*|}
+  # wget-ssl раньше ca-certificates: после него feed-HTTPS уже может работать
+  for pkg in wget-ssl ca-certificates; do
+    fn=$(awk -v p="$pkg" '
+      $1=="Package:" && $2==p {hit=1; next}
+      $1=="Package:" {hit=0}
+      hit && $1=="Filename:" {print $2; exit}
+    ' "$txt")
+    if [ -z "$fn" ]; then
+      error "В Packages нет $pkg"; rm -f "$txt"; return 1
+    fi
     dest="/tmp/opkg-boot-$$-$fn"
     info "  curl $fn …"
-    if ! curl -fsSL --connect-timeout 5 --max-time 60 -o "$dest" "$url" 2>/dev/null; then
-      error "  не скачать $fn"
-      rm -f "$dest"
-      return 1
+    if ! _opkg_http_get "${base}/${ap}/${fn}" "$dest" 5 60; then
+      error "  не скачать $fn"; rm -f "$dest" "$txt"; return 1
     fi
     sz=$(wc -c < "$dest" 2>/dev/null | tr -d ' \n')
     case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
     if [ "$sz" -lt 5000 ]; then
-      error "  $fn слишком мал ($sz Б) — обрыв/мусор"
-      rm -f "$dest"
-      return 1
+      error "  $fn слишком мал ($sz Б)"; rm -f "$dest" "$txt"; return 1
     fi
-    info "  opkg install $fn ($sz Б)…"
-    if ! opkg install "$dest" 2>/dev/null; then
-      # уже установлен / конфликт — пробуем force-reinstall
-      opkg install --force-reinstall "$dest" 2>/dev/null || \
+    info "  opkg install ./$fn ($(_opkg_fmt_sz "$sz"))…"
+    if ! _opkg_install_local_ipk "$dest"; then
+      # fallback: после wget-ssl можно поставить ca-certificates из feed
+      if [ "$pkg" = "ca-certificates" ] && is_installed "wget-ssl" 2>/dev/null; then
+        info "  fallback: opkg install ca-certificates (feed)…"
+        opkg install ca-certificates 2>/dev/null || warn "  ca-certificates не встал"
+      else
         warn "  opkg install $fn не удался"
+      fi
     fi
     rm -f "$dest"
+    refresh_opkg_cache 2>/dev/null || true
   done
-
+  rm -f "$txt"
   opkg remove wget-nossl 2>/dev/null || true
   return 0
 }
 
-# 3. Починить OPKG: http→https, затем зеркала; перезапись /opt/etc/opkg.conf.
+# Параллельный probe: первый полный Packages.gz (+keendev) побеждает.
+# stderr — статус; stdout — base URL.
+_opkg_probe_mirrors_parallel() {
+  local ap="$1" has_kd="$2" skip="$3"
+  local dir="/tmp/opkg-par-$$" pids="" base i=0 winner="" sz ksz line
+  local bases="http://bin.entware.net https://bin.entware.net \
+https://mirrors.bfsu.edu.cn/entware https://mirrors.nju.edu.cn/entware \
+https://mirrors.cqupt.edu.cn/entware https://entware.diversion.ch \
+https://sw.ext.io/entware"
+
+  mkdir -p "$dir" || return 1
+  for base in $bases; do
+    [ -n "$skip" ] && [ "$base" = "$skip" ] && continue
+    i=$((i + 1))
+    (
+      _b="$base"; _ap="$ap"; _kd="$has_kd"; _d="$dir"; _i="$i"
+      _dest="${_d}/${_i}.bin"; _meta="${_d}/${_i}.meta"
+      if ! _opkg_http_get "${_b}/${_ap}/Packages.gz" "$_dest" 5 25; then
+        echo "fail" > "$_meta"; exit 0
+      fi
+      _sz=$(wc -c < "$_dest" 2>/dev/null | tr -d ' \n')
+      case "$_sz" in ''|*[!0-9]*) _sz=0 ;; esac
+      rm -f "$_dest"
+      if [ "$_sz" -le "$OPKG_MIN_MAIN" ]; then
+        echo "trunc $_sz" > "$_meta"; exit 0
+      fi
+      _ksz=0
+      if [ "$_kd" = "1" ]; then
+        if _opkg_http_get "${_b}/${_ap}/keenetic/Packages.gz" "$_dest" 5 15; then
+          _ksz=$(wc -c < "$_dest" 2>/dev/null | tr -d ' \n')
+          case "$_ksz" in ''|*[!0-9]*) _ksz=0 ;; esac
+          rm -f "$_dest"
+        fi
+        if [ "$_ksz" -le "$OPKG_MIN_KD" ]; then
+          echo "nokd" > "$_meta"; exit 0
+        fi
+      fi
+      echo "ok ${_b} ${_sz} ${_ksz}" > "$_meta"
+    ) &
+    pids="$pids $!"
+  done
+
+  # poll до 30 с
+  _w=0
+  while [ "$_w" -lt 30 ]; do
+    for meta in "$dir"/*.meta; do
+      [ -f "$meta" ] || continue
+      line=$(cat "$meta" 2>/dev/null)
+      case "$line" in
+        ok\ *)
+          winner=$(printf '%s\n' "$line" | awk '{print $2}')
+          sz=$(printf '%s\n' "$line" | awk '{print $3}')
+          ksz=$(printf '%s\n' "$line" | awk '{print $4}')
+          break
+          ;;
+      esac
+    done
+    [ -n "$winner" ] && break
+    _alive=0
+    for pid in $pids; do
+      kill -0 "$pid" 2>/dev/null && _alive=1 && break
+    done
+    [ "$_alive" = "0" ] && break
+    sleep 1
+    _w=$((_w + 1))
+  done
+
+  if [ -n "$winner" ]; then
+    printf '  %s/%s … %s (%s)' "$winner" "$ap" "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$sz")" >&2
+    [ "${ksz:-0}" -gt 0 ] 2>/dev/null && \
+      printf ' + keendev %s (%s)' "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$ksz")" >&2
+    printf ' %s\n' "${GREEN}← выбран${NC}" >&2
+  fi
+
+  for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+  for pid in $pids; do wait "$pid" 2>/dev/null || true; done
+
+  # если никто не выиграл — кратко почему
+  if [ -z "$winner" ]; then
+    for meta in "$dir"/*.meta; do
+      [ -f "$meta" ] || continue
+      line=$(cat "$meta" 2>/dev/null)
+      case "$line" in
+        trunc\ *) OPKG_PROBE_TRUNC=1 ;;
+      esac
+    done
+  fi
+
+  rm -rf "$dir"
+  [ -n "$winner" ] && printf '%s\n' "$winner"
+}
+
+# Перезаписать src/gz entware (+keendev) в conf.
+_opkg_rewrite_conf() {
+  local conf="$1" base="$2" ap="$3" kd="$4" tmp
+  tmp="${conf}.new.$$"
+  awk -v base="$base" -v ap="$ap" -v kd="$kd" '
+    BEGIN { e=0; k=0 }
+    $1=="src/gz" && $2=="entware" {
+      print "src/gz entware " base "/" ap; e=1; next
+    }
+    $1=="src/gz" && $2=="keendev" {
+      if (kd==1) { print "src/gz keendev " base "/" ap "/keenetic"; k=1 }
+      next
+    }
+    { print }
+    END {
+      if (!e) print "src/gz entware " base "/" ap
+      if (kd==1 && !k) print "src/gz keendev " base "/" ap "/keenetic"
+    }
+  ' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$conf"
+}
+
 service_opkg_fix() {
   local conf="/opt/etc/opkg.conf"
-  local arch_path="" has_keendev=0 ok_base="" base pkg_url kd_url line url
-  local bak tmp changed=0 need_ca=0 need_wssl=0 cur_base="" cur_ok=0 conf_matches=0
+  local arch_path="" has_keendev=0 ok_base="" cur_base="" conf_matches=0
+  local pkg_url kd_url line url name bak need_ca need_wssl
 
   echo
   info "$LBL_S3"
@@ -5830,137 +5927,83 @@ service_opkg_fix() {
     return 1
   fi
 
+  # Один проход: показать src/gz, arch_path, cur_base, has_keendev
   echo
   info "Текущие репозитории:"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
-      src/gz*|src\ *) printf '  %s\n' "$line" ;;
-    esac
-  done < "$conf"
-
-  # arch-path из первого src/gz
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
       src/gz\ *)
-        # src/gz name URL
+        printf '  %s\n' "$line"
+        # shellcheck: name + url
+        name=$(printf '%s\n' "$line" | awk '{print $2}')
         url=$(printf '%s\n' "$line" | awk '{print $3}')
         [ -n "$url" ] || continue
-        arch_path=$(_opkg_arch_path_from_url "$url")
-        [ -n "$arch_path" ] && break
+        if [ -z "$arch_path" ]; then
+          arch_path=$(_opkg_arch_path_from_url "$url")
+        fi
+        case "$name" in
+          keendev) has_keendev=1 ;;
+          entware)
+            [ -n "$arch_path" ] || arch_path=$(_opkg_arch_path_from_url "$url")
+            cur_base=$(printf '%s\n' "$url" | sed "s|/${arch_path}/*$||")
+            ;;
+        esac
         ;;
     esac
   done < "$conf"
 
+  [ -n "$arch_path" ] || arch_path=$(_opkg_arch_path_fallback)
   if [ -z "$arch_path" ]; then
-    arch_path=$(_opkg_arch_path_fallback)
-  fi
-  if [ -z "$arch_path" ]; then
-    error "Не удалось определить arch-путь (mipselsf-k3.4 / aarch64-k3.10 …)."
-    error "Проверьте src/gz в $conf"
+    error "Не удалось определить arch-путь. Проверьте src/gz в $conf"
     return 1
   fi
   info "Arch-path: $arch_path"
 
-  grep -qE '^[[:space:]]*src/gz[[:space:]]+keendev[[:space:]]' "$conf" 2>/dev/null && has_keendev=1
-
-  # Текущий base entware из conf (схема+хост+/path без arch)
-  cur_base=""
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      src/gz\ entware\ *|src/gz\ \ entware\ *)
-        url=$(printf '%s\n' "$line" | awk '{print $3}')
-        [ -n "$url" ] || continue
-        # http://host/arch → http://host  |  https://mirrors…/entware/arch → …/entware
-        cur_base=$(printf '%s\n' "$url" | sed "s|/${arch_path}/*$||")
-        break
-        ;;
-    esac
-  done < "$conf"
-
   echo
-  info "Проверка Packages.gz (полная загрузка)…"
+  info "Проверка Packages.gz…"
   OPKG_PROBE_TRUNC=0
 
-  # 1) Сначала текущий источник из conf — без лишнего перебора зеркал
+  # 1) текущий — короткий timeout
   if [ -n "$cur_base" ]; then
     pkg_url="${cur_base}/${arch_path}/Packages.gz"
     printf '  [текущий] %s … ' "$pkg_url"
-    if _opkg_repo_probe "$pkg_url" 50000; then
-      _opkg_print_probe 1 50000
-      cur_ok=1
+    if _opkg_repo_probe "$pkg_url" "$OPKG_MIN_MAIN" 8 3; then
+      _opkg_print_probe 1 "$OPKG_MIN_MAIN"
       if [ "$has_keendev" = "1" ]; then
-        kd_url="${cur_base}/${arch_path}/keenetic/Packages.gz"
         printf ' + keendev … '
-        if _opkg_repo_probe "$kd_url" 1000; then
-          _opkg_print_probe 1 1000
+        if _opkg_repo_probe "${cur_base}/${arch_path}/keenetic/Packages.gz" "$OPKG_MIN_KD" 6 3; then
+          _opkg_print_probe 1 "$OPKG_MIN_KD"
           printf '\n'
           ok_base="$cur_base"
         else
-          _opkg_print_probe 0 1000
-          printf ' — keendev недоступен, ищем другое…\n'
-          cur_ok=0
+          _opkg_print_probe 0 "$OPKG_MIN_KD"
+          printf ' — ищем другое…\n'
         fi
       else
         printf '\n'
         ok_base="$cur_base"
       fi
     else
-      _opkg_print_probe 0 50000
+      _opkg_print_probe 0 "$OPKG_MIN_MAIN"
       printf '\n'
     fi
   fi
 
-  # 2) Если текущий не ок — перебор кандидатов
+  # 2) параллельные зеркала
   if [ -z "$ok_base" ]; then
-    info "Подбор рабочего зеркала…"
-    # HTTP официальный раньше HTTPS (DPI на TLS).
-    # sw.ext.io/entware — полное; /ent — урезанное, не использовать.
-    for base in \
-      "http://bin.entware.net" \
-      "https://bin.entware.net" \
-      "https://mirrors.bfsu.edu.cn/entware" \
-      "https://mirrors.nju.edu.cn/entware" \
-      "https://mirrors.cqupt.edu.cn/entware" \
-      "https://entware.diversion.ch" \
-      "https://sw.ext.io/entware"
-    do
-      # уже проверили как текущий
-      [ "$base" = "$cur_base" ] && continue
-      pkg_url="${base}/${arch_path}/Packages.gz"
-      printf '  %s … ' "$pkg_url"
-      if ! _opkg_repo_probe "$pkg_url" 50000; then
-        _opkg_print_probe 0 50000
-        printf '\n'
-        continue
-      fi
-      _opkg_print_probe 1 50000
-
-      if [ "$has_keendev" = "1" ]; then
-        kd_url="${base}/${arch_path}/keenetic/Packages.gz"
-        printf ' + keendev … '
-        if ! _opkg_repo_probe "$kd_url" 1000; then
-          _opkg_print_probe 0 1000
-          printf ' — пропуск\n'
-          continue
-        fi
-        _opkg_print_probe 1 1000
-      fi
-      printf '\n'
-      ok_base="$base"
-      break
-    done
+    info "Параллельный подбор зеркала…"
+    ok_base=$(_opkg_probe_mirrors_parallel "$arch_path" "$has_keendev" "$cur_base")
   fi
 
-  if [ "${OPKG_PROBE_TRUNC:-0}" = "1" ]; then
-    warn "Были обрывы загрузки (часто DPI на HTTPS ~16 КБ) — такие источники отброшены."
-  fi
+  [ "${OPKG_PROBE_TRUNC:-0}" = "1" ] && \
+    warn "Были обрывы загрузки (DPI на HTTPS?) — отброшены."
 
   if [ -z "$ok_base" ]; then
-    error "Ни один репозиторий не ответил. Проверьте интернет / DPI / DNS."
+    error "Ни один репозиторий не ответил."
     return 1
   fi
 
-  conf_matches=0
+  # conf уже на ok_base?
   if grep -qE "^[[:space:]]*src/gz[[:space:]]+entware[[:space:]]+${ok_base}/${arch_path}[[:space:]]*$" "$conf" 2>/dev/null; then
     if [ "$has_keendev" != "1" ] || \
        grep -qE "^[[:space:]]*src/gz[[:space:]]+keendev[[:space:]]+${ok_base}/${arch_path}/keenetic[[:space:]]*$" "$conf" 2>/dev/null; then
@@ -5968,13 +6011,26 @@ service_opkg_fix() {
     fi
   fi
 
-  # HTTPS: opkg → wget → нужны ca-certificates + wget-ssl.
-  # Тихо, если уже стоят; bootstrap через curl, если нет.
+  # Сначала conf → рабочее зеркало (иначе opkg/bootstrap тянет с мёртвого HTTP).
+  bak=""
+  if [ "$conf_matches" != "1" ]; then
+    bak="${conf}.bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)"
+    cp "$conf" "$bak" 2>/dev/null && info "Бэкап: $bak" || true
+    if ! _opkg_rewrite_conf "$conf" "$ok_base" "$arch_path" "$has_keendev"; then
+      error "Не удалось записать $conf"
+      return 1
+    fi
+    echo
+    info "Записано:"
+    printf '  src/gz entware %s/%s\n' "$ok_base" "$arch_path"
+    [ "$has_keendev" = "1" ] && printf '  src/gz keendev %s/%s/keenetic\n' "$ok_base" "$arch_path"
+  fi
+
+  # HTTPS: ca-certificates + wget-ssl (после смены conf)
   case "$ok_base" in
     https://*)
       refresh_opkg_cache 2>/dev/null || true
-      need_ca=1
-      need_wssl=1
+      need_ca=1; need_wssl=1
       is_installed "ca-certificates" && need_ca=0
       is_installed "wget-ssl" && need_wssl=0
       if [ "$need_ca" = "1" ] || [ "$need_wssl" = "1" ]; then
@@ -5987,73 +6043,28 @@ service_opkg_fix() {
         fi
       fi
       if is_installed "wget-nossl"; then
-        info "Удаляем wget-nossl (мешает HTTPS)…"
+        info "Удаляем wget-nossl…"
         opkg remove wget-nossl 2>/dev/null || true
         refresh_opkg_cache 2>/dev/null || true
       fi
       ;;
   esac
 
-  # Conf уже на рабочем источнике — только opkg update
-  if [ "$conf_matches" = "1" ]; then
-    echo
-    info "opkg update ($ok_base)…"
-    if opkg update; then
-      info "OPKG в порядке."
-      return 0
-    fi
-    warn "Источник отвечает (curl), но opkg update упал — lists_dir / место / wget-ssl."
-    return 1
-  fi
-
-  bak="${conf}.bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)"
-  cp "$conf" "$bak" 2>/dev/null && info "Бэкап: $bak" || true
-
-  tmp="${conf}.new.$$"
-  # Переписываем только src/gz entware / keendev; остальное без изменений
-  awk -v base="$ok_base" -v ap="$arch_path" -v kd="$has_keendev" '
-    BEGIN { done_e=0; done_k=0 }
-    $1=="src/gz" && $2=="entware" {
-      print "src/gz entware " base "/" ap
-      done_e=1
-      next
-    }
-    $1=="src/gz" && $2=="keendev" {
-      if (kd==1) {
-        print "src/gz keendev " base "/" ap "/keenetic"
-        done_k=1
-      }
-      next
-    }
-    { print }
-    END {
-      if (!done_e) print "src/gz entware " base "/" ap
-      if (kd==1 && !done_k) print "src/gz keendev " base "/" ap "/keenetic"
-    }
-  ' "$conf" > "$tmp" || { error "Не удалось сформировать новый conf"; rm -f "$tmp"; return 1; }
-
-  if ! mv "$tmp" "$conf"; then
-    error "Не удалось записать $conf"
-    rm -f "$tmp"
-    return 1
-  fi
-  changed=1
-
   echo
-  info "Записано в $conf:"
-  printf '  src/gz entware %s/%s\n' "$ok_base" "$arch_path"
-  [ "$has_keendev" = "1" ] && printf '  src/gz keendev %s/%s/keenetic\n' "$ok_base" "$arch_path"
-
-  echo
-  info "opkg update …"
+  info "opkg update ($ok_base)…"
   if opkg update; then
-    info "OPKG исправлен ($ok_base)."
+    if [ "$conf_matches" = "1" ]; then
+      info "OPKG в порядке."
+    else
+      info "OPKG исправлен ($ok_base)."
+    fi
     return 0
   fi
-  error "opkg update не удался после смены источника."
-  if [ -f "$bak" ]; then
-    warn "Восстановление из бэкапа: $bak"
-    cp "$bak" "$conf" 2>/dev/null || true
+  if [ "$conf_matches" = "1" ]; then
+    warn "Источник отвечает (curl), но opkg update упал."
+  else
+    error "opkg update не удался после смены источника."
+    [ -n "$bak" ] && [ -f "$bak" ] && { warn "Откат: $bak"; cp "$bak" "$conf" 2>/dev/null || true; }
   fi
   return 1
 }
