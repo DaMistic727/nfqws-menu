@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.76"
+SCRIPT_VERSION="0.9.77"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -6218,32 +6218,46 @@ _opkg_do_update() {
   return "$rc"
 }
 
-# github.io → ghproxy (обход блокировок GitHub Pages)
-_opkg_github_io_mirror() {
-  local url="$1"
-  case "$url" in
-    https://*.github.io/*|http://*.github.io/*|https://*github.io/*|http://*github.io/*)
-      printf 'https://ghproxy.net/%s\n' "${url#http://}"
-      # если уже http — нормализуем
-      case "$url" in
-        http://*) printf 'https://ghproxy.net/https://%s\n' "${url#http://}" ;;
-        https://*) printf 'https://ghproxy.net/%s\n' "$url" ;;
-      esac
-      ;;
-    *)
-      printf '%s\n' "$url"
-      ;;
+# Кандидаты-зеркала для github.io (порядок). Только HTTPS.
+_opkg_github_io_candidates() {
+  local url="$1" u
+  u=$(printf '%s\n' "$url" | sed 's|^http://|https://|')
+  case "$u" in
+    *ghproxy.net*) printf '%s\n' "$u"; return 0 ;;
   esac
+  printf '%s\n' "https://ghproxy.net/${u}"
+  printf '%s\n' "https://mirror.ghproxy.com/${u}"
 }
 
-# Починить / удалить проблемные src/gz из /opt/etc/opkg/*.conf
-# github.io → ghproxy; остальные мёртвые — предложить удалить conf.
+# Packages.gz доступен? $1=base_url (без /Packages.gz)
+_opkg_repo_reachable() {
+  local base="$1" tmp="/tmp/opkg-reach-$$.gz" sz=0
+  rm -f "$tmp"
+  if ! _opkg_http_get "${base}/Packages.gz" "$tmp" 3 12; then
+    rm -f "$tmp"
+    return 1
+  fi
+  sz=$(wc -c < "$tmp" 2>/dev/null | tr -d ' \n')
+  rm -f "$tmp"
+  case "$sz" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$sz" -gt 200 ]
+}
+
+# Подменить src/gz name URL в файле conf (только после успешного probe).
+_opkg_conf_set_url() {
+  local f="$1" name="$2" newu="$3"
+  sed -i "s|^src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || \
+    sed -i "s|src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || true
+}
+
+# Починить доп. репо: СНАЧАЛА probe зеркала, ПОТОМ правка .conf.
+# github.io → первое живое зеркало; иначе предложить удалить.
 _opkg_heal_extra_repos() {
-  local f line name url newu mirrored=0 removed=0
+  local f line name url newu cand sz mirrored=0 removed=0 found=0
   local dir="/opt/etc/opkg"
   [ -d "$dir" ] || return 1
 
-  for f in "$dir"/*.conf; do
+  for f in "$dir"/*.conf /opt/etc/opkg.conf; do
     [ -f "$f" ] || continue
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
@@ -6251,37 +6265,58 @@ _opkg_heal_extra_repos() {
           name=$(printf '%s\n' "$line" | awk '{print $2}')
           url=$(printf '%s\n' "$line" | awk '{print $3}')
           [ -n "$url" ] || continue
-          # уже ок?
-          if _opkg_http_get "${url}/Packages.gz" "/tmp/opkg-heal-$$.gz" 4 15; then
-            sz=$(wc -c < /tmp/opkg-heal-$$.gz 2>/dev/null | tr -d ' \n')
-            rm -f /tmp/opkg-heal-$$.gz
-            case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
-            [ "$sz" -gt 200 ] && continue
+          # в основном conf не трогаем entware/keendev
+          if [ "$f" = "/opt/etc/opkg.conf" ]; then
+            case "$name" in entware|keendev) continue ;; esac
           fi
-          rm -f /tmp/opkg-heal-$$.gz
+
+          printf '  %s … ' "$name"
+          if _opkg_repo_reachable "$url"; then
+            printf '%sok%s\n' "$GREEN" "$NC"
+            continue
+          fi
+          printf '%sнет%s\n' "$RED" "$NC"
 
           case "$url" in
             *github.io*)
-              newu=$(printf '%s\n' "$url" | sed 's|^http://|https://|')
-              newu="https://ghproxy.net/${newu}"
-              # не дублировать ghproxy
-              case "$url" in
-                *ghproxy.net*) newu="$url" ;;
-              esac
-              if [ "$newu" != "$url" ]; then
-                info "  $name: github.io → ghproxy"
-                info "    $url"
-                info "    → $newu"
-                # подмена URL в conf
-                sed -i "s|^src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || \
-                  sed -i "s|src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || true
-                mirrored=$((mirrored + 1))
+              found=0
+              info "  подбор зеркала для $name (probe до правки conf)…"
+              for cand in $(_opkg_github_io_candidates "$url"); do
+                [ "$cand" = "$url" ] && continue
+                printf '    %s … ' "$cand"
+                if _opkg_repo_reachable "$cand"; then
+                  printf '%sok%s\n' "$GREEN" "$NC"
+                  info "  $name → $cand"
+                  _opkg_conf_set_url "$f" "$name" "$cand"
+                  mirrored=$((mirrored + 1))
+                  found=1
+                  break
+                fi
+                printf '%sнет%s\n' "$RED" "$NC"
+              done
+              if [ "$found" != "1" ]; then
+                warn "  зеркала github.io недоступны для $name"
+                if confirm_no "Удалить/отключить репозиторий $name?"; then
+                  if [ "$f" = "/opt/etc/opkg.conf" ]; then
+                    sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
+                    info "  закомментирован в opkg.conf"
+                  else
+                    rm -f "$f" && info "  удалён: $f"
+                  fi
+                  removed=$((removed + 1))
+                  break
+                fi
               fi
               ;;
             *)
               warn "  $name недоступен: $url"
-              if confirm_no "Удалить репозиторий $name ($f)?"; then
-                rm -f "$f" && info "  удалён: $f"
+              if confirm_no "Удалить/отключить репозиторий $name?"; then
+                if [ "$f" = "/opt/etc/opkg.conf" ]; then
+                  sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
+                  info "  закомментирован в opkg.conf"
+                else
+                  rm -f "$f" && info "  удалён: $f"
+                fi
                 removed=$((removed + 1))
                 break
               fi
@@ -6291,41 +6326,6 @@ _opkg_heal_extra_repos() {
       esac
     done < "$f"
   done
-
-  # Также битые src/gz в основном conf (не entware/keendev)
-  if [ -f /opt/etc/opkg.conf ]; then
-    f=/opt/etc/opkg.conf
-    # собираем имена для возможной правки github.io в main conf
-    while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in
-        src/gz\ *)
-          name=$(printf '%s\n' "$line" | awk '{print $2}')
-          url=$(printf '%s\n' "$line" | awk '{print $3}')
-          case "$name" in entware|keendev) continue ;; esac
-          [ -n "$url" ] || continue
-          case "$url" in
-            *github.io*)
-              case "$url" in *ghproxy.net*) continue ;; esac
-              newu="https://ghproxy.net/$(printf '%s' "$url" | sed 's|^http://|https://|')"
-              info "  $name (opkg.conf): github.io → ghproxy"
-              sed -i "s|^src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || true
-              mirrored=$((mirrored + 1))
-              ;;
-            *)
-              if ! _opkg_http_get "${url}/Packages.gz" "/tmp/opkg-heal-$$.gz" 4 12; then
-                warn "  $name в opkg.conf недоступен: $url"
-                if confirm_no "Закомментировать src/gz $name в opkg.conf?"; then
-                  sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
-                  removed=$((removed + 1))
-                fi
-              fi
-              rm -f /tmp/opkg-heal-$$.gz
-              ;;
-          esac
-          ;;
-      esac
-    done < "$f"
-  fi
 
   [ "$mirrored" -gt 0 ] || [ "$removed" -gt 0 ]
 }
