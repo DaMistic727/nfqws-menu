@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.80"
+SCRIPT_VERSION="0.9.81"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -6208,13 +6208,14 @@ https://sw.ext.io/entware"
 
 
 # Починить /opt/lib/opkg/status: NUL и склеенные записи → segfault list/update.
+# Детект NUL через tr -cd (busybox grep $'\0' даёт ложные срабатывания).
 _opkg_repair_status() {
-  local st="/opt/lib/opkg/status" bak tmp fixed n0 n1
+  local st="/opt/lib/opkg/status" bak tmp fixed n0 n1 nuls
   [ -f "$st" ] || return 0
-  if ! grep -q $'\0' "$st" 2>/dev/null; then
-    return 0
-  fi
-  warn "Повреждён /opt/lib/opkg/status (NUL/битые записи) — чиню…"
+  nuls=$(tr -cd '\000' < "$st" 2>/dev/null | wc -c | tr -d ' \n')
+  case "$nuls" in ''|*[!0-9]*) nuls=0 ;; esac
+  [ "$nuls" -gt 0 ] || return 0
+  warn "Повреждён /opt/lib/opkg/status ($nuls NUL) — чиню…"
   bak="${st}.bak.corrupt.$(date +%Y%m%d%H%M%S)"
   cp -a "$st" "$bak" 2>/dev/null || true
   info "  бэкап: $bak"
@@ -6378,31 +6379,29 @@ _opkg_heal_extra_repos() {
                 printf '%sнет%s\n' "$RED" "$NC"
               done
               if [ "$found" != "1" ]; then
-                warn "  зеркала github.io недоступны для $name"
-                if confirm_no "Удалить/отключить репозиторий $name?"; then
-                  if [ "$f" = "/opt/etc/opkg.conf" ]; then
-                    sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
-                    info "  закомментирован в opkg.conf"
-                  else
-                    rm -f "$f" && info "  удалён: $f"
-                  fi
-                  removed=$((removed + 1))
-                  break
-                fi
-              fi
-              ;;
-            *)
-              warn "  $name недоступен: $url"
-              if confirm_no "Удалить/отключить репозиторий $name?"; then
+                warn "  зеркала github.io недоступны для $name — отключаю"
                 if [ "$f" = "/opt/etc/opkg.conf" ]; then
                   sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
                   info "  закомментирован в opkg.conf"
                 else
-                  rm -f "$f" && info "  удалён: $f"
+                  mv "$f" "${f}.disabled" 2>/dev/null || rm -f "$f"
+                  info "  → ${f}.disabled (вернуть: mv ${f}.disabled $f)"
                 fi
                 removed=$((removed + 1))
                 break
               fi
+              ;;
+            *)
+              warn "  $name недоступен: $url — отключаю"
+              if [ "$f" = "/opt/etc/opkg.conf" ]; then
+                sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
+                info "  закомментирован в opkg.conf"
+              else
+                mv "$f" "${f}.disabled" 2>/dev/null || rm -f "$f"
+                info "  → ${f}.disabled"
+              fi
+              removed=$((removed + 1))
+              break
               ;;
           esac
           ;;
