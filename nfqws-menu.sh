@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.63"
+SCRIPT_VERSION="0.9.65"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5674,14 +5674,46 @@ service_dropbear_fix() {
 OPKG_MIN_MAIN=50000
 OPKG_MIN_KD=1000
 
+# Запуск cmd с жёстким лимитом секунд (busybox timeout -t N | coreutils timeout N).
+_opkg_run_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    # BusyBox: timeout -t SECS CMD; GNU: timeout SECS CMD
+    timeout -t "$secs" "$@" 2>/dev/null && return 0
+    timeout "$secs" "$@" 2>/dev/null && return 0
+    return 1
+  fi
+  "$@" 2>/dev/null
+}
+
 # HTTP GET в файл. $1=url $2=dest $3=connect $4=max_time
+# Без curl остаётся wget — у него DNS-hang чаще; всегда timeout + -4 у curl.
 _opkg_http_get() {
   local url="$1" dest="$2" conn="${3:-5}" maxt="${4:-25}"
+  local curl_bin="" wget_bin=""
   rm -f "$dest"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout "$conn" --max-time "$maxt" -o "$dest" "$url" 2>/dev/null
+  case "$maxt" in ''|*[!0-9]*) maxt=25 ;; esac
+  case "$conn" in ''|*[!0-9]*) conn=5 ;; esac
+
+  # предпочитаем Entware curl/wget-ssl, если есть
+  if [ -x /opt/bin/curl ]; then
+    curl_bin=/opt/bin/curl
+  elif command -v curl >/dev/null 2>&1; then
+    curl_bin=$(command -v curl)
+  fi
+  if [ -x /opt/bin/wget ]; then
+    wget_bin=/opt/bin/wget
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -T "$maxt" -O "$dest" "$url" 2>/dev/null
+    wget_bin=$(command -v wget)
+  fi
+
+  if [ -n "$curl_bin" ]; then
+    _opkg_run_timeout "$maxt" "$curl_bin" -fsSL -4 \
+      --connect-timeout "$conn" --max-time "$maxt" --retry 0 \
+      -o "$dest" "$url"
+  elif [ -n "$wget_bin" ]; then
+    # wget без SSL на https:// сразу fail; на http:// DNS может висеть без timeout(1)
+    _opkg_run_timeout "$maxt" "$wget_bin" -q -T "$maxt" -O "$dest" "$url"
   else
     return 1
   fi
@@ -5980,16 +6012,20 @@ service_opkg_fix() {
 
   echo
   info "Проверка Packages.gz…"
+  if ! command -v curl >/dev/null 2>&1 && [ ! -x /opt/bin/curl ]; then
+    warn "curl нет — probe через wget (DNS/HTTPS менее надёжны). opkg install curl"
+  fi
 
-  # 1) текущий — короткий timeout
+  # 1) текущий — жёсткий короткий timeout (DNS/DPI на bin.entware.net часто «висит»)
   if [ -n "$cur_base" ]; then
     pkg_url="${cur_base}/${arch_path}/Packages.gz"
     printf '  [текущий] %s … ' "$pkg_url"
-    if _opkg_repo_probe "$pkg_url" "$OPKG_MIN_MAIN" 8 3; then
+    # max=5s connect=2s — не держать меню
+    if _opkg_repo_probe "$pkg_url" "$OPKG_MIN_MAIN" 5 2; then
       _opkg_print_probe 1 "$OPKG_MIN_MAIN"
       if [ "$has_keendev" = "1" ]; then
         printf ' + keendev … '
-        if _opkg_repo_probe "${cur_base}/${arch_path}/keenetic/Packages.gz" "$OPKG_MIN_KD" 6 3; then
+        if _opkg_repo_probe "${cur_base}/${arch_path}/keenetic/Packages.gz" "$OPKG_MIN_KD" 4 2; then
           _opkg_print_probe 1 "$OPKG_MIN_KD"
           printf '\n'
           ok_base="$cur_base"
