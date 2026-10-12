@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.68"
+SCRIPT_VERSION="0.9.76"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5674,25 +5674,62 @@ service_dropbear_fix() {
 OPKG_MIN_MAIN=50000
 OPKG_MIN_KD=1000
 
-# Есть ли клиент с HTTPS? curl — да; wget-ssl/gnu wget с https — да; wget-nossl — нет.
+# Есть ли клиент с HTTPS? curl / /opt/bin/wget (wget-ssl). PATH busybox wget — нет.
 _opkg_has_https() {
   if [ -x /opt/bin/curl ] || command -v curl >/dev/null 2>&1; then
     return 0
   fi
-  # Entware wget-ssl обычно даёт /opt/bin/wget с https
   if [ -x /opt/bin/wget ]; then
+    t=$(readlink /opt/bin/wget 2>/dev/null || true)
+    case "$t" in *busybox*|busybox) ;;
+      *)
+        # wget-ssl: binary не symlink на busybox
+        return 0
+        ;;
+    esac
     /opt/bin/wget --version 2>&1 | grep -qi 'https\|ssl\|openssl\|gnutls' && return 0
-    # короткая проверка: help содержит https
     /opt/bin/wget --help 2>&1 | grep -qi https && return 0
   fi
+  return 1
+}
+
+# Выбор wget: /opt/bin/wget (wget-ssl) раньше PATH (/opt/usr/bin/wget→busybox).
+_opkg_pick_wget() {
+  local c t
+  if [ -x /opt/bin/wget ]; then
+    t=$(readlink /opt/bin/wget 2>/dev/null || true)
+    case "$t" in
+      *busybox*|busybox) ;;
+      *)
+        printf '%s\n' /opt/bin/wget
+        return 0
+        ;;
+    esac
+  fi
   if command -v wget >/dev/null 2>&1; then
-    wget --help 2>&1 | grep -qi https && return 0
+    c=$(command -v wget)
+    t=$(readlink "$c" 2>/dev/null || true)
+    case "$t" in
+      *busybox*|busybox) ;;
+      *)
+        printf '%s\n' "$c"
+        return 0
+        ;;
+    esac
+  fi
+  for c in /bin/wget /usr/bin/wget /opt/usr/bin/wget; do
+    [ -x "$c" ] || continue
+    printf '%s\n' "$c"
+    return 0
+  done
+  if command -v busybox >/dev/null 2>&1 && busybox wget --help >/dev/null 2>&1; then
+    printf '%s\n' "busybox wget"
+    return 0
   fi
   return 1
 }
 
 # HTTP GET с жёстким лимитом: фоновый wget/curl + kill -9 по таймеру.
-# Не зависит от timeout(1): BusyBox wget на DNS без curl может висеть вечно.
 # $1=url $2=dest $3=connect $4=max_time
 _opkg_http_get() {
   local url="$1" dest="$2" conn="${3:-5}" maxt="${4:-25}"
@@ -5702,29 +5739,30 @@ _opkg_http_get() {
   case "$conn" in ''|*[!0-9]*) conn=5 ;; esac
   [ "$maxt" -lt 2 ] && maxt=2
 
-  if [ -x /opt/bin/curl ]; then
+  if [ -x /opt/bin/curl ] && /opt/bin/curl --version >/dev/null 2>&1; then
     curl_bin=/opt/bin/curl
   elif command -v curl >/dev/null 2>&1; then
     curl_bin=$(command -v curl)
   fi
-  if [ -x /opt/bin/wget ]; then
-    wget_bin=/opt/bin/wget
-  elif command -v wget >/dev/null 2>&1; then
-    wget_bin=$(command -v wget)
-  fi
+  wget_bin=$(_opkg_pick_wget 2>/dev/null) || wget_bin=""
 
   if [ -n "$curl_bin" ]; then
     "$curl_bin" -fsSL -4 --connect-timeout "$conn" --max-time "$maxt" \
       --retry 0 -o "$dest" "$url" 2>/dev/null &
     pid=$!
   elif [ -n "$wget_bin" ]; then
-    "$wget_bin" -q -T "$maxt" -O "$dest" "$url" 2>/dev/null &
+    # GNU wget-ssl: -T ok; busybox symlink: -T → segfault → только -O
+    # shellcheck disable=SC2086
+    if _opkg_wget_is_busybox "$wget_bin"; then
+      $wget_bin -O "$dest" "$url" 2>/dev/null &
+    else
+      $wget_bin -q -T "$maxt" -O "$dest" "$url" 2>/dev/null &
+    fi
     pid=$!
   else
     return 1
   fi
 
-  # ждём завершения или maxt секунд, затем kill -9
   i=0
   while [ "$i" -lt "$maxt" ]; do
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -5809,34 +5847,137 @@ _opkg_install_local_ipk() {
   ( cd "$dir" && opkg install "./$base" )
 }
 
-# Нет curl/wget-ssl: качаем wget-ssl + ca-certificates по HTTP с зеркала
+# /opt/usr/bin/wget -> busybox: флаг -T даёт Segmentation fault на Keenetic.
+_opkg_wget_is_busybox() {
+  local w="$1" t
+  case "$w" in *busybox*) return 0 ;; esac
+  t=$(readlink "$w" 2>/dev/null || true)
+  case "$t" in *busybox*|busybox) return 0 ;; esac
+  return 1
+}
+
+# Синхронный wget как вручную: wget -O dest url (без -T для busybox).
+# $1=url $2=dest $3=max_time [$4=extra]
+_opkg_wget_fg() {
+  local url="$1" dest="$2" maxt="${3:-25}" extra="${4:-}"
+  local wbin err="/tmp/opkg-wget-$$.err" rc=0
+  rm -f "$dest" "$err"
+  wbin=$(_opkg_pick_wget 2>/dev/null) || return 1
+  case "$maxt" in ''|*[!0-9]*) maxt=25 ;; esac
+
+  # shellcheck disable=SC2086
+  if _opkg_wget_is_busybox "$wbin"; then
+    if [ -n "$extra" ]; then
+      $wbin $extra -O "$dest" "$url" >"$err" 2>&1 || rc=$?
+    else
+      $wbin -O "$dest" "$url" >"$err" 2>&1 || rc=$?
+    fi
+  else
+    if [ -n "$extra" ]; then
+      $wbin -T "$maxt" $extra -O "$dest" "$url" >"$err" 2>&1 || rc=$?
+    else
+      $wbin -T "$maxt" -O "$dest" "$url" >"$err" 2>&1 || rc=$?
+    fi
+  fi
+
+  if [ -f "$dest" ] && [ -s "$dest" ]; then
+    rm -f "$err"
+    return 0
+  fi
+  if [ -s "$err" ]; then
+    printf '%s' " ($(head -c 100 "$err" | tr '\n' ' '))"
+  elif [ "$rc" -eq 139 ] 2>/dev/null || [ "$rc" -ge 128 ] 2>/dev/null; then
+    printf '%s' " (crash rc=$rc)"
+  fi
+  rm -f "$err" "$dest"
+  return 1
+}
+
+# GET с 3 попытками (DNS: bad address с 1-го раза — у вас так и было).
+_opkg_http_get_retry() {
+  local url="$1" dest="$2" _c="${3:-5}" maxt="${4:-25}" tries="${5:-3}" n=1
+  while [ "$n" -le "$tries" ]; do
+    if _opkg_wget_fg "$url" "$dest" "$maxt"; then
+      return 0
+    fi
+    rm -f "$dest"
+    [ "$n" -lt "$tries" ] && sleep 2
+    n=$((n + 1))
+  done
+  return 1
+}
+
+# IP-fallback sw.ext.io + Host (без Host — пустой ответ).
+_opkg_http_get_sw_ip() {
+  local path="$1" dest="$2" maxt="${3:-25}"
+  local url="http://109.122.198.249${path}"
+  _opkg_wget_fg "$url" "$dest" "$maxt" "--header=Host:sw.ext.io"
+}
+
+# Нет curl/wget-ssl: качаем wget-ssl + curl + ca-certificates по HTTP с зеркала
 # (http://sw.ext.io/entware отдаёт 200), ставим локально → дальше HTTPS доступен.
 _opkg_bootstrap_ssl_via_http() {
   local ap="$1"
   local base gz txt fn dest sz pkg
-  local bases="http://sw.ext.io/entware http://bin.entware.net"
+  # Только HTTP. DNS часто сбоит → retry + IP sw.ext.io.
+  local bases="http://sw.ext.io/entware http://mirrors.bfsu.edu.cn/entware \
+http://mirrors.nju.edu.cn/entware http://entware.diversion.ch http://bin.entware.net"
+  local ok_base="" use_ip=0
 
-  info "Bootstrap HTTPS-клиента по HTTP (wget-ssl + ca-certificates)…"
+  info "Bootstrap HTTPS-клиента по HTTP (wget-ssl + curl + ca-certificates)…"
   _opkg_tmp_cleanup
+  wget_bin=$(_opkg_pick_wget 2>/dev/null) || true
+  if [ -n "$wget_bin" ]; then
+    info "  wget: $wget_bin"
+  else
+    warn "  рабочий wget не найден (проверьте /bin/wget)"
+  fi
 
   gz="" txt="/tmp/opkg-boot-$$.txt"
   for base in $bases; do
     gz="/tmp/opkg-boot-$$.gz"
-    info "  Packages.gz: $base/$ap …"
-    if _opkg_http_get "${base}/${ap}/Packages.gz" "$gz" 4 20; then
+    printf '  Packages.gz: %s/%s … ' "$base" "$ap"
+    if _opkg_http_get_retry "${base}/${ap}/Packages.gz" "$gz" 5 25 3; then
       sz=$(wc -c < "$gz" 2>/dev/null | tr -d ' \n')
       case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
       if [ "$sz" -gt 50000 ]; then
-        info "  ok ($(_opkg_fmt_sz "$sz")) ← $base"
+        printf '%s (%s)\n' "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$sz")"
+        ok_base="$base"
         break
       fi
+      printf '%s (%s)\n' "${YELLOW}мало${NC}" "$(_opkg_fmt_sz "$sz")"
+    else
+      printf '%s\n' "${RED}нет${NC}"
     fi
     rm -f "$gz"
     gz=""
-    base=""
   done
+
+  # DNS bad address: прямой IP sw.ext.io + Host
+  if [ -z "$ok_base" ]; then
+    gz="/tmp/opkg-boot-$$.gz"
+    printf '  Packages.gz: http://109.122.198.249/entware/%s (IP sw.ext.io) … ' "$ap"
+    if _opkg_http_get_sw_ip "/entware/${ap}/Packages.gz" "$gz" 25; then
+      sz=$(wc -c < "$gz" 2>/dev/null | tr -d ' \n')
+      case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+      if [ "$sz" -gt 50000 ]; then
+        printf '%s (%s)\n' "${GREEN}ok${NC}" "$(_opkg_fmt_sz "$sz")"
+        ok_base="http://sw.ext.io/entware"
+        use_ip=1
+      else
+        printf '%s (%s)\n' "${YELLOW}мало${NC}" "$(_opkg_fmt_sz "$sz")"
+        rm -f "$gz"; gz=""
+      fi
+    else
+      printf '%s\n' "${RED}нет${NC}"
+      rm -f "$gz"; gz=""
+    fi
+  fi
+
+  base="$ok_base"
   if [ -z "$gz" ] || [ -z "$base" ]; then
-    error "HTTP Packages.gz недоступен (sw.ext.io / bin.entware.net)."
+    error "HTTP Packages.gz недоступен со всех зеркал (часто DNS: bad address)."
+    error "Повторите или: wget -O /tmp/p.gz http://sw.ext.io/entware/${ap}/Packages.gz"
     _opkg_tmp_cleanup
     return 1
   fi
@@ -5853,18 +5994,26 @@ _opkg_bootstrap_ssl_via_http() {
     error "Не распаковать Packages.gz"; _opkg_tmp_cleanup; return 1
   fi
 
-  for pkg in wget-ssl ca-certificates; do
+  for pkg in wget-ssl curl ca-certificates; do
     fn=$(awk -v p="$pkg" '
       $1=="Package:" && $2==p {hit=1; next}
       $1=="Package:" {hit=0}
       hit && $1=="Filename:" {print $2; exit}
     ' "$txt")
     if [ -z "$fn" ]; then
+      if [ "$pkg" = "curl" ]; then
+        warn "В Packages нет curl — пропуск"
+        continue
+      fi
       error "В Packages нет $pkg"; _opkg_tmp_cleanup; return 1
     fi
     dest="/tmp/opkg-boot-$$-$fn"
-    info "  curl/wget $fn …"
-    if ! _opkg_http_get "${base}/${ap}/${fn}" "$dest" 5 60; then
+    info "  download $fn …"
+    if [ "$use_ip" = "1" ]; then
+      if ! _opkg_http_get_sw_ip "/entware/${ap}/${fn}" "$dest" 60; then
+        error "  не скачать $fn (IP)"; _opkg_tmp_cleanup; return 1
+      fi
+    elif ! _opkg_http_get_retry "${base}/${ap}/${fn}" "$dest" 5 60 3; then
       error "  не скачать $fn"; _opkg_tmp_cleanup; return 1
     fi
     sz=$(wc -c < "$dest" 2>/dev/null | tr -d ' \n')
@@ -5882,9 +6031,11 @@ _opkg_bootstrap_ssl_via_http() {
   rm -f "$txt"
   opkg remove wget-nossl 2>/dev/null || true
   _opkg_tmp_cleanup
+  # wget-ssl → /opt/bin/wget; PATH часто раньше даёт /opt/usr/bin/wget→busybox
+  export PATH="/opt/bin:/opt/sbin:/opt/usr/bin:$PATH"
 
   if _opkg_has_https; then
-    info "HTTPS-клиент готов (wget-ssl)."
+    info "HTTPS-клиент готов ($(_opkg_pick_wget 2>/dev/null || echo wget-ssl))."
     return 0
   fi
   warn "После установки HTTPS всё ещё недоступен."
@@ -5904,7 +6055,7 @@ _opkg_bootstrap_https_deps() {
   local gz="/tmp/opkg-boot-$$.gz" txt="/tmp/opkg-boot-$$.txt"
   local fn dest sz pkg
 
-  info "Bootstrap: wget-ssl → ca-certificates (curl + local opkg install)…"
+  info "Bootstrap: wget-ssl → curl → ca-certificates (local opkg install)…"
   _opkg_tmp_cleanup
   if ! _opkg_http_get "${base}/${ap}/Packages.gz" "$gz" 5 30; then
     error "Не скачать Packages.gz"; _opkg_tmp_cleanup; return 1
@@ -5921,18 +6072,22 @@ _opkg_bootstrap_https_deps() {
     error "Не распаковать Packages.gz"; _opkg_tmp_cleanup; return 1
   fi
 
-  # wget-ssl раньше ca-certificates: после него feed-HTTPS уже может работать
-  for pkg in wget-ssl ca-certificates; do
+  # wget-ssl → curl → ca-certificates (HTTPS для probe/opkg)
+  for pkg in wget-ssl curl ca-certificates; do
     fn=$(awk -v p="$pkg" '
       $1=="Package:" && $2==p {hit=1; next}
       $1=="Package:" {hit=0}
       hit && $1=="Filename:" {print $2; exit}
     ' "$txt")
     if [ -z "$fn" ]; then
+      if [ "$pkg" = "curl" ]; then
+        warn "В Packages нет curl — пропуск"
+        continue
+      fi
       error "В Packages нет $pkg"; _opkg_tmp_cleanup; return 1
     fi
     dest="/tmp/opkg-boot-$$-$fn"
-    info "  curl $fn …"
+    info "  download $fn …"
     if ! _opkg_http_get "${base}/${ap}/${fn}" "$dest" 5 60; then
       error "  не скачать $fn"; _opkg_tmp_cleanup; return 1
     fi
@@ -6051,6 +6206,129 @@ https://sw.ext.io/entware"
   [ -n "$OPKG_PROBE_WINNER" ]
 }
 
+
+# opkg update: 0 = полный успех; 1 = ошибка (логируем).
+_opkg_do_update() {
+  local log="/tmp/opkg-upd-$$.log" rc=0
+  opkg update >"$log" 2>&1 || rc=$?
+  cat "$log" 2>/dev/null || true
+  # сохраняем для heal
+  rm -f /tmp/opkg-upd-last.log
+  mv "$log" /tmp/opkg-upd-last.log 2>/dev/null || cp "$log" /tmp/opkg-upd-last.log 2>/dev/null || true
+  return "$rc"
+}
+
+# github.io → ghproxy (обход блокировок GitHub Pages)
+_opkg_github_io_mirror() {
+  local url="$1"
+  case "$url" in
+    https://*.github.io/*|http://*.github.io/*|https://*github.io/*|http://*github.io/*)
+      printf 'https://ghproxy.net/%s\n' "${url#http://}"
+      # если уже http — нормализуем
+      case "$url" in
+        http://*) printf 'https://ghproxy.net/https://%s\n' "${url#http://}" ;;
+        https://*) printf 'https://ghproxy.net/%s\n' "$url" ;;
+      esac
+      ;;
+    *)
+      printf '%s\n' "$url"
+      ;;
+  esac
+}
+
+# Починить / удалить проблемные src/gz из /opt/etc/opkg/*.conf
+# github.io → ghproxy; остальные мёртвые — предложить удалить conf.
+_opkg_heal_extra_repos() {
+  local f line name url newu mirrored=0 removed=0
+  local dir="/opt/etc/opkg"
+  [ -d "$dir" ] || return 1
+
+  for f in "$dir"/*.conf; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        src/gz\ *|src\ *)
+          name=$(printf '%s\n' "$line" | awk '{print $2}')
+          url=$(printf '%s\n' "$line" | awk '{print $3}')
+          [ -n "$url" ] || continue
+          # уже ок?
+          if _opkg_http_get "${url}/Packages.gz" "/tmp/opkg-heal-$$.gz" 4 15; then
+            sz=$(wc -c < /tmp/opkg-heal-$$.gz 2>/dev/null | tr -d ' \n')
+            rm -f /tmp/opkg-heal-$$.gz
+            case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+            [ "$sz" -gt 200 ] && continue
+          fi
+          rm -f /tmp/opkg-heal-$$.gz
+
+          case "$url" in
+            *github.io*)
+              newu=$(printf '%s\n' "$url" | sed 's|^http://|https://|')
+              newu="https://ghproxy.net/${newu}"
+              # не дублировать ghproxy
+              case "$url" in
+                *ghproxy.net*) newu="$url" ;;
+              esac
+              if [ "$newu" != "$url" ]; then
+                info "  $name: github.io → ghproxy"
+                info "    $url"
+                info "    → $newu"
+                # подмена URL в conf
+                sed -i "s|^src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || \
+                  sed -i "s|src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || true
+                mirrored=$((mirrored + 1))
+              fi
+              ;;
+            *)
+              warn "  $name недоступен: $url"
+              if confirm_no "Удалить репозиторий $name ($f)?"; then
+                rm -f "$f" && info "  удалён: $f"
+                removed=$((removed + 1))
+                break
+              fi
+              ;;
+          esac
+          ;;
+      esac
+    done < "$f"
+  done
+
+  # Также битые src/gz в основном conf (не entware/keendev)
+  if [ -f /opt/etc/opkg.conf ]; then
+    f=/opt/etc/opkg.conf
+    # собираем имена для возможной правки github.io в main conf
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        src/gz\ *)
+          name=$(printf '%s\n' "$line" | awk '{print $2}')
+          url=$(printf '%s\n' "$line" | awk '{print $3}')
+          case "$name" in entware|keendev) continue ;; esac
+          [ -n "$url" ] || continue
+          case "$url" in
+            *github.io*)
+              case "$url" in *ghproxy.net*) continue ;; esac
+              newu="https://ghproxy.net/$(printf '%s' "$url" | sed 's|^http://|https://|')"
+              info "  $name (opkg.conf): github.io → ghproxy"
+              sed -i "s|^src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || true
+              mirrored=$((mirrored + 1))
+              ;;
+            *)
+              if ! _opkg_http_get "${url}/Packages.gz" "/tmp/opkg-heal-$$.gz" 4 12; then
+                warn "  $name в opkg.conf недоступен: $url"
+                if confirm_no "Закомментировать src/gz $name в opkg.conf?"; then
+                  sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
+                  removed=$((removed + 1))
+                fi
+              fi
+              rm -f /tmp/opkg-heal-$$.gz
+              ;;
+          esac
+          ;;
+      esac
+    done < "$f"
+  fi
+
+  [ "$mirrored" -gt 0 ] || [ "$removed" -gt 0 ]
+}
 
 # Перезаписать src/gz entware (+keendev) в conf.
 _opkg_rewrite_conf() {
@@ -6225,7 +6503,7 @@ service_opkg_fix() {
   echo
   info "opkg update ($ok_base)…"
   opkg_kill_others
-  if opkg update; then
+  if _opkg_do_update; then
     if [ "$conf_matches" = "1" ]; then
       info "OPKG в порядке."
     else
@@ -6234,6 +6512,27 @@ service_opkg_fix() {
     _opkg_tmp_cleanup
     return 0
   fi
+
+  # Упало из‑за доп. репо (/opt/etc/opkg/*.conf), а не entware — не откатываем основной conf
+  warn "opkg update с ошибками — проверяем доп. репозитории…"
+  if _opkg_heal_extra_repos; then
+    info "Повтор opkg update…"
+    opkg_kill_others
+    if _opkg_do_update; then
+      info "OPKG исправлен ($ok_base)."
+      _opkg_tmp_cleanup
+      return 0
+    fi
+  fi
+
+  # Основной индекс entware уже мог обновиться — не откатываем рабочее зеркало
+  if [ -s /opt/var/opkg-lists/entware ]; then
+    warn "Основной entware обновлён, но часть доп. репо всё ещё с ошибками."
+    info "OPKG частично исправлен ($ok_base) — conf не откатываем."
+    _opkg_tmp_cleanup
+    return 0
+  fi
+
   if [ "$conf_matches" = "1" ]; then
     warn "Источник отвечает (curl), но opkg update упал."
   else
