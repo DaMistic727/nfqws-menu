@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.81"
+SCRIPT_VERSION="0.9.82"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -6279,17 +6279,6 @@ _opkg_do_update() {
   return "$rc"
 }
 
-# Кандидаты-зеркала для github.io (порядок). Только HTTPS.
-_opkg_github_io_candidates() {
-  local url="$1" u
-  u=$(printf '%s\n' "$url" | sed 's|^http://|https://|')
-  case "$u" in
-    *ghproxy.net*) printf '%s\n' "$u"; return 0 ;;
-  esac
-  printf '%s\n' "https://ghproxy.net/${u}"
-  printf '%s\n' "https://mirror.ghproxy.com/${u}"
-}
-
 # Packages.gz доступен? $1=base_url (без /Packages.gz)
 _opkg_repo_reachable() {
   local base="$1" tmp="/tmp/opkg-reach-$$.gz" sz=0
@@ -6304,15 +6293,7 @@ _opkg_repo_reachable() {
   [ "$sz" -gt 200 ]
 }
 
-# Подменить src/gz name URL в файле conf (только после успешного probe).
-_opkg_conf_set_url() {
-  local f="$1" name="$2" newu="$3"
-  sed -i "s|^src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || \
-    sed -i "s|src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || true
-}
-
 # Убрать дубли src/gz entware|keendev из /opt/etc/opkg/*.conf
-# (должны быть только в /opt/etc/opkg.conf — иначе Duplicate src declaration).
 _opkg_dedupe_entware() {
   local f n=0
   for f in /opt/etc/opkg/*.conf; do
@@ -6333,15 +6314,26 @@ _opkg_dedupe_entware() {
   [ "$n" -gt 0 ]
 }
 
-# Починить доп. репо: СНАЧАЛА probe зеркала, ПОТОМ правка .conf.
-# github.io → первое живое зеркало; иначе предложить удалить.
-# entware/keendev в *.conf — только через _opkg_dedupe_entware, здесь не трогаем.
+# Отключить один репо: /opt/etc/opkg/foo.conf → .disabled; в opkg.conf — комментарий.
+_opkg_disable_repo() {
+  local f="$1" name="$2"
+  if [ "$f" = "/opt/etc/opkg.conf" ]; then
+    sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
+    info "  закомментирован: $name в opkg.conf"
+  else
+    mv "$f" "${f}.disabled" 2>/dev/null || rm -f "$f"
+    info "  отключён: ${f}.disabled"
+  fi
+}
+
+# Простые доп. репо: список мёртвых → спросить → отключить. Без зеркал.
 _opkg_heal_extra_repos() {
-  local f line name url cand mirrored=0 removed=0 found=0
+  local f line name url fail="/tmp/opkg-fail-$$.txt" nfail=0 removed=0
   local dir="/opt/etc/opkg"
 
   _opkg_dedupe_entware || true
-  [ -d "$dir" ] || return 1
+  rm -f "$fail"
+  : > "$fail"
 
   for f in "$dir"/*.conf /opt/etc/opkg.conf; do
     [ -f "$f" ] || continue
@@ -6351,65 +6343,52 @@ _opkg_heal_extra_repos() {
           name=$(printf '%s\n' "$line" | awk '{print $2}')
           url=$(printf '%s\n' "$line" | awk '{print $3}')
           [ -n "$url" ] || continue
-          # entware/keendev — только в главном conf; в *.conf уже вычищены
           case "$name" in entware|keendev) continue ;; esac
-
-          printf '  %s … ' "$name"
           if _opkg_repo_reachable "$url"; then
-            printf '%sok%s\n' "$GREEN" "$NC"
             continue
           fi
-          printf '%sнет%s\n' "$RED" "$NC"
-
-          case "$url" in
-            *github.io*)
-              found=0
-              info "  подбор зеркала для $name (probe до правки conf)…"
-              for cand in $(_opkg_github_io_candidates "$url"); do
-                [ "$cand" = "$url" ] && continue
-                printf '    %s … ' "$cand"
-                if _opkg_repo_reachable "$cand"; then
-                  printf '%sok%s\n' "$GREEN" "$NC"
-                  info "  $name → $cand"
-                  _opkg_conf_set_url "$f" "$name" "$cand"
-                  mirrored=$((mirrored + 1))
-                  found=1
-                  break
-                fi
-                printf '%sнет%s\n' "$RED" "$NC"
-              done
-              if [ "$found" != "1" ]; then
-                warn "  зеркала github.io недоступны для $name — отключаю"
-                if [ "$f" = "/opt/etc/opkg.conf" ]; then
-                  sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
-                  info "  закомментирован в opkg.conf"
-                else
-                  mv "$f" "${f}.disabled" 2>/dev/null || rm -f "$f"
-                  info "  → ${f}.disabled (вернуть: mv ${f}.disabled $f)"
-                fi
-                removed=$((removed + 1))
-                break
-              fi
-              ;;
-            *)
-              warn "  $name недоступен: $url — отключаю"
-              if [ "$f" = "/opt/etc/opkg.conf" ]; then
-                sed -i "s|^src/gz ${name} |# src/gz ${name} |" "$f" 2>/dev/null || true
-                info "  закомментирован в opkg.conf"
-              else
-                mv "$f" "${f}.disabled" 2>/dev/null || rm -f "$f"
-                info "  → ${f}.disabled"
-              fi
-              removed=$((removed + 1))
-              break
-              ;;
-          esac
+          # file|name|url
+          printf '%s|%s|%s\n' "$f" "$name" "$url" >> "$fail"
+          nfail=$((nfail + 1))
           ;;
       esac
     done < "$f"
   done
 
-  [ "$mirrored" -gt 0 ] || [ "$removed" -gt 0 ]
+  if [ "$nfail" -eq 0 ]; then
+    rm -f "$fail"
+    return 1
+  fi
+
+  echo
+  printf '%s%s%s\n' "$RED" "Не прошли проверку следующие репозитории:" "$NC"
+  while IFS='|' read -r f name url; do
+    printf '  %s%s%s\n' "$RED" "$name — $url" "$NC"
+  done < "$fail"
+  echo
+
+  drain_stdin 2>/dev/null || true
+  # читаем с tty, иначе Enter от меню проглатывается
+  ans=''
+  printf '%s' "${YELLOW}Отключить и проверить без них? [Y/n]: ${NC}"
+  if [ -c /dev/tty ]; then
+    read -r ans < /dev/tty || true
+  else
+    read -r ans || true
+  fi
+  case "$ans" in n|N|н|Н)
+    info "Оставляем как есть."
+    rm -f "$fail"
+    return 1
+    ;;
+  esac
+
+  while IFS='|' read -r f name url; do
+    _opkg_disable_repo "$f" "$name"
+    removed=$((removed + 1))
+  done < "$fail"
+  rm -f "$fail"
+  [ "$removed" -gt 0 ]
 }
 
 # Перезаписать src/gz entware (+keendev) в conf.
