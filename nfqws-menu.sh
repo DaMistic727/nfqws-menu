@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.65"
+SCRIPT_VERSION="0.9.68"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5674,28 +5674,34 @@ service_dropbear_fix() {
 OPKG_MIN_MAIN=50000
 OPKG_MIN_KD=1000
 
-# Запуск cmd с жёстким лимитом секунд (busybox timeout -t N | coreutils timeout N).
-_opkg_run_timeout() {
-  local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then
-    # BusyBox: timeout -t SECS CMD; GNU: timeout SECS CMD
-    timeout -t "$secs" "$@" 2>/dev/null && return 0
-    timeout "$secs" "$@" 2>/dev/null && return 0
-    return 1
+# Есть ли клиент с HTTPS? curl — да; wget-ssl/gnu wget с https — да; wget-nossl — нет.
+_opkg_has_https() {
+  if [ -x /opt/bin/curl ] || command -v curl >/dev/null 2>&1; then
+    return 0
   fi
-  "$@" 2>/dev/null
+  # Entware wget-ssl обычно даёт /opt/bin/wget с https
+  if [ -x /opt/bin/wget ]; then
+    /opt/bin/wget --version 2>&1 | grep -qi 'https\|ssl\|openssl\|gnutls' && return 0
+    # короткая проверка: help содержит https
+    /opt/bin/wget --help 2>&1 | grep -qi https && return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget --help 2>&1 | grep -qi https && return 0
+  fi
+  return 1
 }
 
-# HTTP GET в файл. $1=url $2=dest $3=connect $4=max_time
-# Без curl остаётся wget — у него DNS-hang чаще; всегда timeout + -4 у curl.
+# HTTP GET с жёстким лимитом: фоновый wget/curl + kill -9 по таймеру.
+# Не зависит от timeout(1): BusyBox wget на DNS без curl может висеть вечно.
+# $1=url $2=dest $3=connect $4=max_time
 _opkg_http_get() {
   local url="$1" dest="$2" conn="${3:-5}" maxt="${4:-25}"
-  local curl_bin="" wget_bin=""
+  local curl_bin="" wget_bin="" pid="" i=0
   rm -f "$dest"
   case "$maxt" in ''|*[!0-9]*) maxt=25 ;; esac
   case "$conn" in ''|*[!0-9]*) conn=5 ;; esac
+  [ "$maxt" -lt 2 ] && maxt=2
 
-  # предпочитаем Entware curl/wget-ssl, если есть
   if [ -x /opt/bin/curl ]; then
     curl_bin=/opt/bin/curl
   elif command -v curl >/dev/null 2>&1; then
@@ -5708,15 +5714,29 @@ _opkg_http_get() {
   fi
 
   if [ -n "$curl_bin" ]; then
-    _opkg_run_timeout "$maxt" "$curl_bin" -fsSL -4 \
-      --connect-timeout "$conn" --max-time "$maxt" --retry 0 \
-      -o "$dest" "$url"
+    "$curl_bin" -fsSL -4 --connect-timeout "$conn" --max-time "$maxt" \
+      --retry 0 -o "$dest" "$url" 2>/dev/null &
+    pid=$!
   elif [ -n "$wget_bin" ]; then
-    # wget без SSL на https:// сразу fail; на http:// DNS может висеть без timeout(1)
-    _opkg_run_timeout "$maxt" "$wget_bin" -q -T "$maxt" -O "$dest" "$url"
+    "$wget_bin" -q -T "$maxt" -O "$dest" "$url" 2>/dev/null &
+    pid=$!
   else
     return 1
   fi
+
+  # ждём завершения или maxt секунд, затем kill -9
+  i=0
+  while [ "$i" -lt "$maxt" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      [ -f "$dest" ] && [ -s "$dest" ]
+      return $?
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
   [ -f "$dest" ] && [ -s "$dest" ]
 }
 
@@ -5787,6 +5807,88 @@ _opkg_install_local_ipk() {
   base=$(basename "$file")
   # относительный путь из каталога файла — надёжнее на Entware
   ( cd "$dir" && opkg install "./$base" )
+}
+
+# Нет curl/wget-ssl: качаем wget-ssl + ca-certificates по HTTP с зеркала
+# (http://sw.ext.io/entware отдаёт 200), ставим локально → дальше HTTPS доступен.
+_opkg_bootstrap_ssl_via_http() {
+  local ap="$1"
+  local base gz txt fn dest sz pkg
+  local bases="http://sw.ext.io/entware http://bin.entware.net"
+
+  info "Bootstrap HTTPS-клиента по HTTP (wget-ssl + ca-certificates)…"
+  _opkg_tmp_cleanup
+
+  gz="" txt="/tmp/opkg-boot-$$.txt"
+  for base in $bases; do
+    gz="/tmp/opkg-boot-$$.gz"
+    info "  Packages.gz: $base/$ap …"
+    if _opkg_http_get "${base}/${ap}/Packages.gz" "$gz" 4 20; then
+      sz=$(wc -c < "$gz" 2>/dev/null | tr -d ' \n')
+      case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+      if [ "$sz" -gt 50000 ]; then
+        info "  ok ($(_opkg_fmt_sz "$sz")) ← $base"
+        break
+      fi
+    fi
+    rm -f "$gz"
+    gz=""
+    base=""
+  done
+  if [ -z "$gz" ] || [ -z "$base" ]; then
+    error "HTTP Packages.gz недоступен (sw.ext.io / bin.entware.net)."
+    _opkg_tmp_cleanup
+    return 1
+  fi
+
+  if command -v zcat >/dev/null 2>&1; then
+    zcat "$gz" > "$txt" 2>/dev/null
+  elif command -v gzip >/dev/null 2>&1; then
+    gzip -dc "$gz" > "$txt" 2>/dev/null
+  else
+    gunzip -c "$gz" > "$txt" 2>/dev/null || true
+  fi
+  rm -f "$gz"
+  if [ ! -s "$txt" ]; then
+    error "Не распаковать Packages.gz"; _opkg_tmp_cleanup; return 1
+  fi
+
+  for pkg in wget-ssl ca-certificates; do
+    fn=$(awk -v p="$pkg" '
+      $1=="Package:" && $2==p {hit=1; next}
+      $1=="Package:" {hit=0}
+      hit && $1=="Filename:" {print $2; exit}
+    ' "$txt")
+    if [ -z "$fn" ]; then
+      error "В Packages нет $pkg"; _opkg_tmp_cleanup; return 1
+    fi
+    dest="/tmp/opkg-boot-$$-$fn"
+    info "  curl/wget $fn …"
+    if ! _opkg_http_get "${base}/${ap}/${fn}" "$dest" 5 60; then
+      error "  не скачать $fn"; _opkg_tmp_cleanup; return 1
+    fi
+    sz=$(wc -c < "$dest" 2>/dev/null | tr -d ' \n')
+    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    if [ "$sz" -lt 5000 ]; then
+      error "  $fn слишком мал ($sz Б)"; _opkg_tmp_cleanup; return 1
+    fi
+    info "  opkg install ./$fn ($(_opkg_fmt_sz "$sz"))…"
+    if ! _opkg_install_local_ipk "$dest"; then
+      warn "  opkg install $fn не удался"
+    fi
+    rm -f "$dest"
+    refresh_opkg_cache 2>/dev/null || true
+  done
+  rm -f "$txt"
+  opkg remove wget-nossl 2>/dev/null || true
+  _opkg_tmp_cleanup
+
+  if _opkg_has_https; then
+    info "HTTPS-клиент готов (wget-ssl)."
+    return 0
+  fi
+  warn "После установки HTTPS всё ещё недоступен."
+  return 1
 }
 
 # Удалить хвосты bootstrap/probe в /tmp (в т.ч. от прошлых запусков)
@@ -5861,6 +5963,7 @@ _opkg_bootstrap_https_deps() {
 _opkg_probe_mirrors_parallel() {
   local ap="$1" has_kd="$2" skip="$3"
   local dir="/tmp/opkg-par-$$" pids="" base i=0 winner="" sz ksz line
+  local can_https=0
   local bases="http://bin.entware.net https://bin.entware.net \
 https://mirrors.bfsu.edu.cn/entware https://mirrors.nju.edu.cn/entware \
 https://mirrors.cqupt.edu.cn/entware https://entware.diversion.ch \
@@ -5868,9 +5971,16 @@ https://sw.ext.io/entware"
 
   OPKG_PROBE_WINNER=""
   mkdir -p "$dir" || return 1
+  _opkg_has_https && can_https=1
 
   for base in $bases; do
     [ -n "$skip" ] && [ "$base" = "$skip" ] && continue
+    # без curl/wget-ssl https:// бесполезен (wget: not an http or ftp url)
+    case "$base" in
+      https://*)
+        [ "$can_https" = "1" ] || continue
+        ;;
+    esac
     i=$((i + 1))
     (
       _b="$base"; _ap="$ap"; _kd="$has_kd"; _d="$dir"; _i="$i"
@@ -6011,10 +6121,19 @@ service_opkg_fix() {
   info "Arch-path: $arch_path"
 
   echo
-  info "Проверка Packages.gz…"
-  if ! command -v curl >/dev/null 2>&1 && [ ! -x /opt/bin/curl ]; then
-    warn "curl нет — probe через wget (DNS/HTTPS менее надёжны). opkg install curl"
+  # Нет HTTPS: сначала wget-ssl+ca-certificates по HTTP с sw.ext.io, потом обычный probe
+  if ! _opkg_has_https; then
+    warn "Нет HTTPS-клиента (curl / wget-ssl) — пробуем поставить по HTTP…"
+    if _opkg_bootstrap_ssl_via_http "$arch_path"; then
+      info "Дальше доступны https:// зеркала."
+    else
+      warn "Bootstrap не удался. Зеркала https:// будут пропущены."
+      warn "Останется только http:// (часто мёртв)."
+    fi
+    echo
   fi
+
+  info "Проверка Packages.gz…"
 
   # 1) текущий — жёсткий короткий timeout (DNS/DPI на bin.entware.net часто «висит»)
   if [ -n "$cur_base" ]; then
