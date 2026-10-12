@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.77"
+SCRIPT_VERSION="0.9.80"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -6207,14 +6207,74 @@ https://sw.ext.io/entware"
 }
 
 
-# opkg update: 0 = полный успех; 1 = ошибка (логируем).
+# Починить /opt/lib/opkg/status: NUL и склеенные записи → segfault list/update.
+_opkg_repair_status() {
+  local st="/opt/lib/opkg/status" bak tmp fixed n0 n1
+  [ -f "$st" ] || return 0
+  if ! grep -q $'\0' "$st" 2>/dev/null; then
+    return 0
+  fi
+  warn "Повреждён /opt/lib/opkg/status (NUL/битые записи) — чиню…"
+  bak="${st}.bak.corrupt.$(date +%Y%m%d%H%M%S)"
+  cp -a "$st" "$bak" 2>/dev/null || true
+  info "  бэкап: $bak"
+  tmp="/tmp/opkg-status-$$.nonul"
+  fixed="/tmp/opkg-status-$$.fixed"
+  tr -d '\000' < "$st" > "$tmp" 2>/dev/null || cp "$st" "$tmp"
+  awk 'BEGIN{RS="";ORS="\n\n"} /^Package: / && /Status: / {print}' "$tmp" > "$fixed"
+  n0=$(grep -c '^Package:' "$st" 2>/dev/null || echo 0)
+  n1=$(grep -c '^Package:' "$fixed" 2>/dev/null || echo 0)
+  if [ ! -s "$fixed" ]; then
+    error "  не удалось восстановить status"
+    rm -f "$tmp" "$fixed"
+    return 1
+  fi
+  cp "$fixed" "$st"
+  info "  status: записей ~$n0 → $n1 (без NUL)"
+  rm -f "$tmp" "$fixed"
+  return 0
+}
+
+# PATH для opkg: /opt/bin (wget-ssl) раньше /opt/usr/bin (busybox wget → segfault).
+_opkg_prepare_env() {
+  export PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/bin:/usr/bin:$PATH"
+  # busybox-symlink в /opt/usr/bin/wget ломает HTTPS-загрузки opkg
+  if [ -x /opt/bin/wget ]; then
+    t=$(readlink /opt/bin/wget 2>/dev/null || true)
+    case "$t" in
+      *busybox*|busybox) ;;
+      *)
+        # временно прячем busybox wget из PATH-приоритета
+        if [ -L /opt/usr/bin/wget ]; then
+          rt=$(readlink /opt/usr/bin/wget 2>/dev/null || true)
+          case "$rt" in
+            *busybox*|busybox)
+              if [ ! -e /opt/usr/bin/wget.busybox-bak ]; then
+                mv /opt/usr/bin/wget /opt/usr/bin/wget.busybox-bak 2>/dev/null || true
+                ln -sf /opt/bin/wget /opt/usr/bin/wget 2>/dev/null || true
+                info "wget: /opt/usr/bin/wget → /opt/bin/wget (wget-ssl)"
+              fi
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  fi
+}
+
+# opkg update: 0 = успех; 1 = ошибка. Ловим segfault (rc 139).
 _opkg_do_update() {
   local log="/tmp/opkg-upd-$$.log" rc=0
+  _opkg_prepare_env
   opkg update >"$log" 2>&1 || rc=$?
   cat "$log" 2>/dev/null || true
-  # сохраняем для heal
   rm -f /tmp/opkg-upd-last.log
-  mv "$log" /tmp/opkg-upd-last.log 2>/dev/null || cp "$log" /tmp/opkg-upd-last.log 2>/dev/null || true
+  mv "$log" /tmp/opkg-upd-last.log 2>/dev/null || true
+  if [ "$rc" -eq 139 ] || [ "$rc" -eq 11 ]; then
+    error "opkg update: Segmentation fault (rc=$rc)"
+    warn "Частая причина: busybox wget вместо wget-ssl."
+    warn "Проверьте: ls -la /opt/bin/wget /opt/usr/bin/wget; PATH=/opt/bin:\$PATH opkg update"
+  fi
   return "$rc"
 }
 
@@ -6250,11 +6310,36 @@ _opkg_conf_set_url() {
     sed -i "s|src/gz ${name} .*|src/gz ${name} ${newu}|" "$f" 2>/dev/null || true
 }
 
+# Убрать дубли src/gz entware|keendev из /opt/etc/opkg/*.conf
+# (должны быть только в /opt/etc/opkg.conf — иначе Duplicate src declaration).
+_opkg_dedupe_entware() {
+  local f n=0
+  for f in /opt/etc/opkg/*.conf; do
+    [ -f "$f" ] || continue
+    if grep -qE '^[[:space:]]*src/gz[[:space:]]+(entware|keendev)[[:space:]]' "$f" 2>/dev/null; then
+      warn "Дубликат entware/keendev в $f — удаляю строки"
+      grep -E '^[[:space:]]*src/gz[[:space:]]+(entware|keendev)[[:space:]]' "$f" 2>/dev/null | while IFS= read -r L; do
+        info "  − $L"
+      done
+      sed -i -e '/^[[:space:]]*src\/gz[[:space:]]*entware[[:space:]]/d' \
+             -e '/^[[:space:]]*src\/gz[[:space:]]*keendev[[:space:]]/d' "$f" 2>/dev/null || true
+      if ! grep -qE '^[[:space:]]*src/gz[[:space:]]' "$f" 2>/dev/null; then
+        rm -f "$f" && info "  удалён пустой $f"
+      fi
+      n=$((n + 1))
+    fi
+  done
+  [ "$n" -gt 0 ]
+}
+
 # Починить доп. репо: СНАЧАЛА probe зеркала, ПОТОМ правка .conf.
 # github.io → первое живое зеркало; иначе предложить удалить.
+# entware/keendev в *.conf — только через _opkg_dedupe_entware, здесь не трогаем.
 _opkg_heal_extra_repos() {
-  local f line name url newu cand sz mirrored=0 removed=0 found=0
+  local f line name url cand mirrored=0 removed=0 found=0
   local dir="/opt/etc/opkg"
+
+  _opkg_dedupe_entware || true
   [ -d "$dir" ] || return 1
 
   for f in "$dir"/*.conf /opt/etc/opkg.conf; do
@@ -6265,10 +6350,8 @@ _opkg_heal_extra_repos() {
           name=$(printf '%s\n' "$line" | awk '{print $2}')
           url=$(printf '%s\n' "$line" | awk '{print $3}')
           [ -n "$url" ] || continue
-          # в основном conf не трогаем entware/keendev
-          if [ "$f" = "/opt/etc/opkg.conf" ]; then
-            case "$name" in entware|keendev) continue ;; esac
-          fi
+          # entware/keendev — только в главном conf; в *.conf уже вычищены
+          case "$name" in entware|keendev) continue ;; esac
 
           printf '  %s … ' "$name"
           if _opkg_repo_reachable "$url"; then
@@ -6365,6 +6448,12 @@ service_opkg_fix() {
     error "Не найден $conf — Entware не установлен?"
     return 1
   fi
+
+  # Дубли entware/keendev в /opt/etc/opkg/*.conf → Duplicate src / segfault risk
+  _opkg_dedupe_entware 2>/dev/null || true
+
+  # Битый status (NUL) → opkg list/update segfault
+  _opkg_repair_status 2>/dev/null || true
 
   # Один проход: показать src/gz, arch_path, cur_base, has_keendev
   echo
