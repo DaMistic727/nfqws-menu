@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.82"
+SCRIPT_VERSION="0.9.83"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5836,15 +5836,16 @@ _opkg_arch_path_fallback() {
   esac
 }
 
-# Установка .ipk строго с диска (opkg не должен ходить в feed).
-# --force-reinstall иногда заставляет Entware-opkg качать из src/gz — не используем.
+# Установка .ipk строго с диска. --nodeps: не тянуть libc/curl с feed
+# (битый wget → «wget returned 255» на зависимостях).
 _opkg_install_local_ipk() {
   local file="$1" dir base
   [ -f "$file" ] && [ -s "$file" ] || return 1
   dir=$(dirname "$file")
   base=$(basename "$file")
-  # относительный путь из каталога файла — надёжнее на Entware
-  ( cd "$dir" && opkg install "./$base" )
+  _opkg_prepare_env 2>/dev/null || true
+  # shellcheck disable=SC2086
+  ( cd "$dir" && opkg install --nodeps "./$base" )
 }
 
 # /opt/usr/bin/wget -> busybox: флаг -T даёт Segmentation fault на Keenetic.
@@ -6327,11 +6328,23 @@ _opkg_disable_repo() {
 }
 
 # Простые доп. репо: список мёртвых → спросить → отключить. Без зеркал.
+# Если wget/opkg сломан (wget returned 255 на всём) — не трогаем репо.
 _opkg_heal_extra_repos() {
   local f line name url fail="/tmp/opkg-fail-$$.txt" nfail=0 removed=0
-  local dir="/opt/etc/opkg"
+  local dir="/opt/etc/opkg" log="/tmp/opkg-upd-last.log"
 
   _opkg_dedupe_entware || true
+
+  # Ложные «мёртвые репо»: opkg/wget 255 на всех URL, включая рабочий entware
+  if [ -f "$log" ] && grep -q 'wget returned 255' "$log" 2>/dev/null; then
+    if grep -qE 'Failed to download.*(entware|bin\.entware|sw\.ext\.io/entware)' "$log" 2>/dev/null; then
+      error "opkg/wget не качает даже основной feed (wget returned 255)."
+      warn "Это не «мёртвые репо» — сначала wget-ssl / PATH (/opt/bin раньше busybox)."
+      warn "Проверка: PATH=/opt/bin:\$PATH wget -O /dev/null http://sw.ext.io/entware/aarch64-k3.10/Packages.gz"
+      return 1
+    fi
+  fi
+
   rm -f "$fail"
   : > "$fail"
 
@@ -6347,7 +6360,6 @@ _opkg_heal_extra_repos() {
           if _opkg_repo_reachable "$url"; then
             continue
           fi
-          # file|name|url
           printf '%s|%s|%s\n' "$f" "$name" "$url" >> "$fail"
           nfail=$((nfail + 1))
           ;;
@@ -6368,7 +6380,6 @@ _opkg_heal_extra_repos() {
   echo
 
   drain_stdin 2>/dev/null || true
-  # читаем с tty, иначе Enter от меню проглатывается
   ans=''
   printf '%s' "${YELLOW}Отключить и проверить без них? [Y/n]: ${NC}"
   if [ -c /dev/tty ]; then
@@ -6421,6 +6432,7 @@ service_opkg_fix() {
   echo
   info "$LBL_S3"
   _opkg_tmp_cleanup
+  _opkg_prepare_env 2>/dev/null || true
 
   if [ ! -f "$conf" ]; then
     error "Не найден $conf — Entware не установлен?"
