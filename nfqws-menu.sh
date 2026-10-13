@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.84"
+SCRIPT_VERSION="0.9.85"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -691,18 +691,26 @@ run_menu_remote_sh() {
 }
 
 # Убить чужие процессы opkg и снять lock (без ожидания).
+# Снять чужой opkg + stale lock (иначе: Could not lock /opt/tmp/opkg.lock).
 opkg_kill_others() {
-  local lock="/opt/tmp/opkg.lock" pids
+  local lock="/opt/tmp/opkg.lock" pids="" p
+  # все процессы opkg (не только -x: busybox pgrep)
   pids=$(pgrep -x opkg 2>/dev/null || true)
-  if [ -z "$pids" ]; then
-    pids=$(pgrep -f '/opkg |^opkg ' 2>/dev/null || true)
-  fi
+  for p in $(pgrep -f '[ /]opkg( |$)' 2>/dev/null || true); do
+    case " $pids " in *" $p "*) ;; *) pids="$pids $p" ;; esac
+  done
+  pids=$(printf '%s\n' $pids | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
   if [ -n "$pids" ]; then
     warn "Останавливаем сторонний opkg: $pids"
     # shellcheck disable=SC2086
     kill -9 $pids 2>/dev/null || true
+    sleep 1
+    # shellcheck disable=SC2086
+    kill -9 $pids 2>/dev/null || true
   fi
-  rm -f "$lock" 2>/dev/null || true
+  rm -f "$lock" /opt/tmp/opkg.lock /var/lock/opkg.lock 2>/dev/null || true
+  # busybox: lock мог остаться symlink/dir
+  [ -e "$lock" ] && rm -rf "$lock" 2>/dev/null || true
 }
 
 # Записать opkg-репозиторий и обновить индекс
@@ -6149,10 +6157,11 @@ _opkg_probe_mirrors_parallel() {
   local ap="$1" has_kd="$2" skip="$3"
   local dir="/tmp/opkg-par-$$" pids="" base i=0 winner="" sz ksz line
   local can_https=0
-  local bases="http://bin.entware.net https://bin.entware.net \
+  # HTTP sw.ext.io первым: без SSL, полный Packages.gz, часто единственный живой за DPI
+  local bases="http://sw.ext.io/entware https://sw.ext.io/entware \
+http://bin.entware.net https://bin.entware.net \
 https://mirrors.bfsu.edu.cn/entware https://mirrors.nju.edu.cn/entware \
-https://mirrors.cqupt.edu.cn/entware https://entware.diversion.ch \
-https://sw.ext.io/entware"
+https://mirrors.cqupt.edu.cn/entware https://entware.diversion.ch"
 
   OPKG_PROBE_WINNER=""
   mkdir -p "$dir" || return 1
@@ -6460,6 +6469,7 @@ service_opkg_fix() {
 
   echo
   info "$LBL_S3"
+  opkg_kill_others
   _opkg_tmp_cleanup
   _opkg_prepare_env 2>/dev/null || true
 
