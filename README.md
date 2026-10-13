@@ -4,7 +4,7 @@
 
 Репозиторий также служит хранилищем готовых **стратегий** обхода DPI, **blobs** и **lists**.
 
-- Скрипт: [`nfqws-menu.sh`](nfqws-menu.sh) (текущая версия **0.9.57**)
+- Скрипт: [`nfqws-menu.sh`](nfqws-menu.sh) (текущая версия **0.9.83**)
 - Стратегии: [`strategies/`](strategies/)
 - Hosts: [`hosts`](hosts)
 - Контрольные суммы: [`SHA256SUMS`](SHA256SUMS), [`strategies/blobs/SHA256SUMS`](strategies/blobs/SHA256SUMS)
@@ -108,6 +108,7 @@ menu
       14. MagiTrickle
       15. telemt / telemt-panel
       16. TG WS Proxy Rust
+      17. firc
 
 [::]  СЕРВИС [S]  |  Language: RU|EN [77]
       88. Удаление пакетов
@@ -393,6 +394,23 @@ Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
 
 Секрет меню пишет само, до установки: генератор секрета в `install.sh` проекта использует `od -An`, которого BusyBox не знает, и на боксе без готового секрета установка падает. Если секрет остался от Go-версии, переносится он — тогда ссылки клиентов не меняются.
 
+### 17. firc
+
+[firc](https://github.com/hoaxisr/firc) — утилита для **точечной маршрутизации трафика по доменам** (FakeIP) на Keenetic / Entware. Нужные домены заворачиваются в выбранный интерфейс (VPN / туннель), остальной трафик не затрагивается.
+
+Через [`installer_firc.sh`](https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh) (пункт меню **17** или напрямую):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh | sh
+```
+
+1. **Установка firc** — ipk с [GitHub Releases](https://github.com/hoaxisr/firc/releases) под архитектуру (aarch64 / mipsel / mips), зависимость `socat`
+2. **Удаление firc** — `opkg remove` + опционально конфиг `/opt/etc/firc`
+
+- Init: `/opt/etc/init.d/S99firc` (start | stop | restart | status)
+- WebUI: обычно порт **666**
+- Статус в блоке установленных компонентов; удаление — здесь или в п. 88
+
 ### 77. Change language
 
 Мгновенное переключение интерфейса **ru ↔ en** (файл `/opt/etc/nfqws-menu.lang`).
@@ -404,7 +422,7 @@ Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
 ```
 Удаление:
   [N] nfqws2-keenetic / nfqws-keenetic-web / dpi-detector /
-      awg-manager / tg-ws-proxy-rs / usque-keenetic /
+      awg-manager / tg-ws-proxy-rs / usque-keenetic / firc /
       magitrickle / opera-proxy / KeenKit / telemt
   [a] Удалить все пакеты NFQWS
   [b] Удалить резервные копии (.bak.* / *-opkg)
@@ -416,6 +434,7 @@ Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
 - **awg-manager** — `opkg remove` + `rm -rf /opt/etc/awg-manager`
 - **tg-ws-proxy-rs** — бинарь, init, конфиги
 - **usque-keenetic** — `opkg remove --autoremove` + `/opt/etc/opkg/usque-keenetic.conf`
+- **firc** — `opkg remove --autoremove` (+ stop `S99firc`)
 - **magitrickle** — `opkg remove` + запрос на удаление `/opt/etc/opkg/magitrickle.conf`
 - **KeenKit** — удаление `/opt/keenkit.sh`
 - **a)** — все пакеты NFQWS + dpi-detector
@@ -429,6 +448,11 @@ Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
 
 ## Changelog
 
+### 0.9.84
+
+- **п. 17** — **firc** ([hoaxisr/firc](https://github.com/hoaxisr/firc)): точечная маршрутизация по доменам (FakeIP); `installer_firc.sh` — установка ipk с Releases + удаление; статус в show_installed
+
+
 ### 0.9.x
 
 - **Архитектура** — `opkg print-architecture` → `/opt/etc/opkg.conf` → `uname`; заголовок `Модель Title ARCH`; предупреждение без Netfilter-kmod
@@ -441,7 +465,7 @@ Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
 
 ### 0.7.0 – 0.8.0
 
-- **Нумерация меню** — единый п. **1** (NFQWS / NFQWS2 / web / .ipk); стратегии/списки **2–8**; утилиты **10–16** (без TG WS Proxy Go)
+- **Нумерация меню** — единый п. **1** (NFQWS / NFQWS2 / web / .ipk); стратегии/списки **2–8**; утилиты **10–17** (без TG WS Proxy Go)
 - **п. 1 → 4** — установка `.ipk` напрямую (GitHub Releases / ghproxy / github.io) при блокировке opkg-репозитория
 - **Проверка обновлений** — фоновый опрос (меню, tg-ws-proxy-rs, dpi-detector, awg-manager…); метка **⭡** в статусе и заголовке; TTL 10 мин (`NFQWS_MENU_UPDATE_TTL`)
 - **TG WS Proxy Go** убран из меню (остаётся миграция секрета/порта при установке Rust)
