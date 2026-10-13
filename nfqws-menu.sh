@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.85"
+SCRIPT_VERSION="0.9.86"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -663,6 +663,10 @@ run_remote_sh() {
     _run_remote_sh_restore_traps
     return 1
   fi
+
+  # opkg.lock от предыдущих update → удалённые скрипты не видят arch
+  opkg_kill_others 2>/dev/null || true
+  export PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/bin:/sbin:/usr/bin:/usr/sbin:$PATH"
 
   # Полный tty — иначе интерактив (awg-menu и т.п.) не поднимается
   if [ -c /dev/tty ]; then
@@ -4169,8 +4173,64 @@ menu_dpi_detector() {
   fi
 }
 
+# Патч detect_arch в install-compressed.sh: opkg lock → пустой print-architecture;
+# доп. разбор src/gz (mipselsf-k3.4) и conf arch.
+_patch_awg_install_arch() {
+  local f="$1" t
+  [ -f "$f" ] || return 1
+  # Уже патчили
+  grep -q '__nfqws_arch_url_fallback' "$f" 2>/dev/null && return 0
+  t="${f}.archfix"
+  # Вставить fallback по src/gz сразу после блока «2) /opt/etc/opkg.conf»
+  awk '
+    { print }
+    /# 3\) uname \/ cpuinfo \(mipsel vs mips\)/ && !done {
+      print "  # __nfqws_arch_url_fallback: src/gz если opkg lock / нет arch-строк"
+      print "  if [ -z \"$A\" ] && [ -f /opt/etc/opkg.conf ]; then"
+      print "    _src=$(grep -E \"^src/gz[[:space:]]\" /opt/etc/opkg.conf 2>/dev/null | head -1)"
+      print "    case \"$_src\" in"
+      print "      *mipselsf*|*mipsel*) A=\"mipsel\" ;;"
+      print "      *mipssf*|*/mips-k*|*mips-3*) A=\"mips\" ;;"
+      print "      *aarch64*|*arm64*) A=\"aarch64\" ;;"
+      print "    esac"
+      print "  fi"
+      done=1
+    }
+  ' "$f" > "$t" && mv "$t" "$f"
+}
+
+
 menu_awg_manager() {
-  run_menu_remote_sh "11" "awg-manager" "$AWG_MANAGER_INSTALL_URL" || return 1
+  local url="$AWG_MANAGER_INSTALL_URL" tmp rc=0 min_bytes=8000
+  echo
+  info "Открываем: 11. awg-manager"
+  info "Источник: $url"
+  printf '%s\n' "================================================"
+
+  rm -f /tmp/nfqws-remote-*.sh 2>/dev/null || true
+  tmp="/tmp/nfqws-remote-$$.sh"
+  trap 'rm -f /tmp/nfqws-remote-$$.sh 2>/dev/null; _run_remote_sh_restore_traps' EXIT INT TERM
+
+  if ! download_sh_validated "$url" "$tmp" "$min_bytes"; then
+    error "Не удалось скачать целый скрипт: $url"
+    rm -f "$tmp"
+    _run_remote_sh_restore_traps
+    return 1
+  fi
+
+  opkg_kill_others 2>/dev/null || true
+  export PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/bin:/sbin:/usr/bin:/usr/sbin:$PATH"
+  _patch_awg_install_arch "$tmp"
+
+  if [ -c /dev/tty ]; then
+    sh "$tmp" < /dev/tty > /dev/tty 2>&1 || rc=$?
+  else
+    sh "$tmp" || rc=$?
+  fi
+  rm -f "$tmp"
+  _run_remote_sh_restore_traps
+  drain_stdin
+  return "$rc"
 }
 
 menu_keenkit() {
