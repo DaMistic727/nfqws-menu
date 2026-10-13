@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.83"
+SCRIPT_VERSION="0.9.84"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -1044,7 +1044,7 @@ EOF
 # kind → «запущен?» (по процессу / порту)
 service_is_up() {
   case "$1" in
-    nfqws|nfqws2|usque|magitrickle|awg-manager) proc_running "$1" ;;
+    nfqws|nfqws2|usque|magitrickle|awg-manager|firc) proc_running "$1" ;;
     # tg-ws-proxy-rs содержит "tg-ws-proxy" подстрокой, поэтому у Go-сборки
     # совпадение по целому имени команды, а у Rust — по своей строке.
     tg-ws-proxy)    proc_running_exact "tg-ws-proxy" ;;
@@ -1238,6 +1238,10 @@ show_installed() {
       if ("usque-keenetic" in opkg) {
         m = mark_run(proc_has("usque")) mark_upd("usque-keenetic", opkg["usque-keenetic"])
         row("usque-keenetic", opkg["usque-keenetic"], m)
+      }
+      if ("firc" in opkg) {
+        m = mark_run(proc_has("firc")) mark_upd("firc", opkg["firc"])
+        row("firc", opkg["firc"], m)
       }
       # tools (tg-ws, dpi, keenkit, telemt)
       if ("tg-ws-proxy-rs" in tools) {
@@ -4847,6 +4851,18 @@ menu_usque_keenetic() {
   refresh_opkg_cache 2>/dev/null || true
 }
 
+# 17. firc — точечная маршрутизация по доменам (FakeIP)
+FIRC_INSTALL_URL="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh"
+
+menu_firc() {
+  # min=2000: installer_firc.sh ~8+ КБ
+  if ! run_menu_remote_sh "17" "firc" "$FIRC_INSTALL_URL" 2000; then
+    error "Установщик firc завершился с ошибкой."
+    return 1
+  fi
+  refresh_opkg_cache 2>/dev/null || true
+}
+
 menu_magitrickle() {
   echo
   info "MagiTrickle"
@@ -5014,6 +5030,17 @@ remove_usque_keenetic() {
   fi
   [ -f /opt/etc/opkg/usque-keenetic.conf ] && rm -f /opt/etc/opkg/usque-keenetic.conf && info "  удалён: /opt/etc/opkg/usque-keenetic.conf"
 }
+
+remove_firc() {
+  if is_installed "firc"; then
+    [ -x /opt/etc/init.d/S99firc ] && /opt/etc/init.d/S99firc stop 2>/dev/null || true
+    opkg remove --autoremove firc 2>/dev/null || opkg remove firc 2>/dev/null || true
+    info "firc удалён."
+  else
+    warn "firc не установлен."
+  fi
+}
+
 
 remove_keenkit() {
   if [ -f /opt/keenkit.sh ]; then
@@ -5444,6 +5471,7 @@ menu_remove() {
   is_awg_manager_installed          && items="$items awg-manager"
   is_tg_ws_proxy_rs_installed       && items="$items tg-ws-proxy-rs"
   is_installed "usque-keenetic"     && items="$items usque-keenetic"
+  is_installed "firc"               && items="$items firc"
   is_installed "magitrickle"        && items="$items magitrickle"
   is_installed "opera-proxy"        && items="$items opera-proxy"
   [ -f /opt/keenkit.sh ]            && items="$items KeenKit"
@@ -5491,6 +5519,7 @@ menu_remove() {
         awg-manager)   remove_awg_manager ;;
         tg-ws-proxy-rs) remove_tg_ws_proxy_rs ;;
         usque-keenetic) remove_usque_keenetic ;;
+        firc)          remove_firc ;;
         magitrickle)   remove_magitrickle ;;
         opera-proxy)   remove_opera_proxy ;;
         KeenKit)       remove_keenkit ;;
@@ -6967,6 +6996,7 @@ main_menu() {
     echo "      14. MagiTrickle"
     echo "      15. telemt / telemt-panel"
     echo "      16. TG WS Proxy Rust"
+    echo "      17. firc"
     echo
     printf '%s\n' "${CYAN}${BOLD}[::]  ${LBL_REMOVE} [${GREEN}S${CYAN}${BOLD}]  |  ${LBL_LANG} [${GREEN}77${CYAN}${BOLD}]${NC}"
     echo "      88. $LBL_88"
@@ -6999,6 +7029,7 @@ main_menu() {
       14) menu_magitrickle || true ;;
       15) menu_telemt || true ;;
       16) menu_tg_ws_proxy_rs || true ;;
+      17) menu_firc || true ;;
       S|s) menu_service || true ;;
       U|u) opkg_upgrade_all || true ;;
       o|O) menu_opera_hidden || true ;;
