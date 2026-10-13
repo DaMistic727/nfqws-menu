@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.83"
+SCRIPT_VERSION="0.10.1"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -666,6 +666,10 @@ run_remote_sh() {
     return 1
   fi
 
+  # opkg.lock от предыдущих update → удалённые скрипты не видят arch
+  opkg_kill_others 2>/dev/null || true
+  export PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/bin:/sbin:/usr/bin:/usr/sbin:$PATH"
+
   # Полный tty — иначе интерактив (awg-menu и т.п.) не поднимается
   if [ -c /dev/tty ]; then
     sh "$tmp" < /dev/tty > /dev/tty 2>&1 || rc=$?
@@ -681,30 +685,36 @@ run_remote_sh() {
 # Единый формат пункта меню → удалённый установщик:
 #   [+] Открываем: 11. awg-manager
 #   [+] Источник: https://...
-#   ================================================
 # $1=номер  $2=название  $3=url  [$4=min_bytes]
 run_menu_remote_sh() {
   local num="$1" name="$2" url="$3" min_bytes="${4:-8000}"
   echo
   info "Открываем: ${num}. ${name}"
   info "Источник: $url"
-  printf '%s\n' "================================================"
   run_remote_sh "$url" "$min_bytes"
 }
 
 # Убить чужие процессы opkg и снять lock (без ожидания).
+# Снять чужой opkg + stale lock (иначе: Could not lock /opt/tmp/opkg.lock).
 opkg_kill_others() {
-  local lock="/opt/tmp/opkg.lock" pids
+  local lock="/opt/tmp/opkg.lock" pids="" p
+  # все процессы opkg (не только -x: busybox pgrep)
   pids=$(pgrep -x opkg 2>/dev/null || true)
-  if [ -z "$pids" ]; then
-    pids=$(pgrep -f '/opkg |^opkg ' 2>/dev/null || true)
-  fi
+  for p in $(pgrep -f '[ /]opkg( |$)' 2>/dev/null || true); do
+    case " $pids " in *" $p "*) ;; *) pids="$pids $p" ;; esac
+  done
+  pids=$(printf '%s\n' $pids | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
   if [ -n "$pids" ]; then
     warn "Останавливаем сторонний opkg: $pids"
     # shellcheck disable=SC2086
     kill -9 $pids 2>/dev/null || true
+    sleep 1
+    # shellcheck disable=SC2086
+    kill -9 $pids 2>/dev/null || true
   fi
-  rm -f "$lock" 2>/dev/null || true
+  rm -f "$lock" /opt/tmp/opkg.lock /var/lock/opkg.lock 2>/dev/null || true
+  # busybox: lock мог остаться symlink/dir
+  [ -e "$lock" ] && rm -rf "$lock" 2>/dev/null || true
 }
 
 # Записать opkg-репозиторий и обновить индекс
@@ -1046,7 +1056,7 @@ EOF
 # kind → «запущен?» (по процессу / порту)
 service_is_up() {
   case "$1" in
-    nfqws|nfqws2|usque|magitrickle|awg-manager) proc_running "$1" ;;
+    nfqws|nfqws2|usque|magitrickle|awg-manager|firc) proc_running "$1" ;;
     # tg-ws-proxy-rs содержит "tg-ws-proxy" подстрокой, поэтому у Go-сборки
     # совпадение по целому имени команды, а у Rust — по своей строке.
     tg-ws-proxy)    proc_running_exact "tg-ws-proxy" ;;
@@ -1241,6 +1251,10 @@ show_installed() {
         m = mark_run(proc_has("usque")) mark_upd("usque-keenetic", opkg["usque-keenetic"])
         row("usque-keenetic", opkg["usque-keenetic"], m)
       }
+      if ("firc" in opkg) {
+        m = mark_run(proc_has("firc")) mark_upd("firc", opkg["firc"])
+        row("firc", opkg["firc"], m)
+      }
       # tools (tg-ws, dpi, keenkit, telemt)
       if ("tg-ws-proxy-rs" in tools) {
         m = mark_run(proc_has("tg-ws-proxy-rs")) mark_upd("tg-ws-proxy-rs", tools["tg-ws-proxy-rs"])
@@ -1391,29 +1405,65 @@ ask_web_install() {
 install_nfqws1() {
   need_arch || return 1
   info "Установка nfqws-keenetic (версия 1)..."
+  if is_installed "nfqws2-keenetic"; then
+    warn "Обнаружен nfqws2-keenetic. Пакеты конфликтуют — nfqws-keenetic нельзя ставить вместе с nfqws2."
+    if confirm_no "Удалить nfqws2-keenetic (и веб-интерфейс) перед установкой nfqws-keenetic?"; then
+      stop_nfqws2_hard
+      opkg remove nfqws-keenetic-web nfqws2-keenetic 2>/dev/null || true
+      stop_nfqws2_hard
+      refresh_opkg_cache
+    else
+      warn "Установка nfqws-keenetic отменена (nfqws2-keenetic остаётся)."
+      return 1
+    fi
+  fi
   install_deps
   ensure_opkg_repo "nfqws-keenetic" "https://nfqws.github.io/nfqws-keenetic/$ARCH"
-  opkg install nfqws-keenetic
-  info "nfqws-keenetic установлен."
-  ask_web_install
+  if opkg install nfqws-keenetic; then
+    refresh_opkg_cache
+    if is_installed "nfqws-keenetic"; then
+      info "nfqws-keenetic установлен."
+      ask_web_install
+    else
+      error "opkg не сообщил об ошибке, но пакет nfqws-keenetic не установлен."
+      return 1
+    fi
+  else
+    error "Не удалось установить nfqws-keenetic (конфликт или ошибка opkg)."
+    return 1
+  fi
 }
 
 install_nfqws2() {
   need_arch || return 1
   info "Установка nfqws2-keenetic (версия 2)..."
   if is_installed "nfqws-keenetic"; then
-    warn "Обнаружен nfqws-keenetic. Рекомендуется удалить его перед установкой nfqws2."
-    if confirm_no "Удалить nfqws-keenetic и веб-интерфейс?"; then
+    warn "Обнаружен nfqws-keenetic. Пакеты конфликтуют — nfqws2 нельзя ставить вместе с nfqws-keenetic."
+    if confirm_no "Удалить nfqws-keenetic (и веб-интерфейс) перед установкой nfqws2?"; then
       stop_nfqws1_hard
       opkg remove nfqws-keenetic-web nfqws-keenetic 2>/dev/null || true
       stop_nfqws1_hard
+      refresh_opkg_cache
+    else
+      warn "Установка nfqws2-keenetic отменена (nfqws-keenetic остаётся)."
+      return 1
     fi
   fi
   install_deps
   ensure_opkg_repo "nfqws2-keenetic" "https://nfqws.github.io/nfqws2-keenetic/$ARCH"
-  opkg install nfqws2-keenetic
-  info "nfqws2-keenetic установлен."
-  ask_web_install
+  if opkg install nfqws2-keenetic; then
+    refresh_opkg_cache
+    if is_installed "nfqws2-keenetic"; then
+      info "nfqws2-keenetic установлен."
+      ask_web_install
+    else
+      error "opkg не сообщил об ошибке, но пакет nfqws2-keenetic не установлен."
+      return 1
+    fi
+  else
+    error "Не удалось установить nfqws2-keenetic (конфликт или ошибка opkg)."
+    return 1
+  fi
 }
 
 # Суффикс архитектуры в имени .ipk
@@ -1704,17 +1754,33 @@ menu_install_ipk_direct() {
   case "$choice" in
     1)
       [ "$v1" = "?" ] && { error "Версия nfqws-keenetic неизвестна."; return 1; }
+      if is_installed "nfqws2-keenetic"; then
+        warn "Обнаружен nfqws2-keenetic. Пакеты конфликтуют — nfqws-keenetic нельзя ставить вместе с nfqws2."
+        if confirm_no "Удалить nfqws2-keenetic (и веб-интерфейс) перед установкой nfqws-keenetic?"; then
+          stop_nfqws2_hard
+          opkg remove nfqws-keenetic-web nfqws2-keenetic 2>/dev/null || true
+          stop_nfqws2_hard
+          refresh_opkg_cache
+        else
+          warn "Установка nfqws-keenetic отменена (nfqws2-keenetic остаётся)."
+          return 1
+        fi
+      fi
       install_ipk_from_repo "nfqws-keenetic" "nfqws-keenetic" "$base1" "$v1" || return 1
       ask_web_install
       ;;
     2)
       [ "$v2" = "?" ] && { error "Версия nfqws2-keenetic неизвестна."; return 1; }
       if is_installed "nfqws-keenetic"; then
-        warn "Обнаружен nfqws-keenetic. Рекомендуется удалить его перед установкой nfqws2."
-        if confirm_no "Удалить nfqws-keenetic и веб-интерфейс?"; then
+        warn "Обнаружен nfqws-keenetic. Пакеты конфликтуют — nfqws2 нельзя ставить вместе с nfqws-keenetic."
+        if confirm_no "Удалить nfqws-keenetic (и веб-интерфейс) перед установкой nfqws2?"; then
           stop_nfqws1_hard
           opkg remove nfqws-keenetic-web nfqws-keenetic 2>/dev/null || true
           stop_nfqws1_hard
+          refresh_opkg_cache
+        else
+          warn "Установка nfqws2-keenetic отменена (nfqws-keenetic остаётся)."
+          return 1
         fi
       fi
       install_ipk_from_repo "nfqws2-keenetic" "nfqws2-keenetic" "$base2" "$v2" || return 1
@@ -4159,8 +4225,63 @@ menu_dpi_detector() {
   fi
 }
 
+# Патч detect_arch в install-compressed.sh: opkg lock → пустой print-architecture;
+# доп. разбор src/gz (mipselsf-k3.4) и conf arch.
+_patch_awg_install_arch() {
+  local f="$1" t
+  [ -f "$f" ] || return 1
+  # Уже патчили
+  grep -q '__nfqws_arch_url_fallback' "$f" 2>/dev/null && return 0
+  t="${f}.archfix"
+  # Вставить fallback по src/gz сразу после блока «2) /opt/etc/opkg.conf»
+  awk '
+    { print }
+    /# 3\) uname \/ cpuinfo \(mipsel vs mips\)/ && !done {
+      print "  # __nfqws_arch_url_fallback: src/gz если opkg lock / нет arch-строк"
+      print "  if [ -z \"$A\" ] && [ -f /opt/etc/opkg.conf ]; then"
+      print "    _src=$(grep -E \"^src/gz[[:space:]]\" /opt/etc/opkg.conf 2>/dev/null | head -1)"
+      print "    case \"$_src\" in"
+      print "      *mipselsf*|*mipsel*) A=\"mipsel\" ;;"
+      print "      *mipssf*|*/mips-k*|*mips-3*) A=\"mips\" ;;"
+      print "      *aarch64*|*arm64*) A=\"aarch64\" ;;"
+      print "    esac"
+      print "  fi"
+      done=1
+    }
+  ' "$f" > "$t" && mv "$t" "$f"
+}
+
+
 menu_awg_manager() {
-  run_menu_remote_sh "11" "awg-manager" "$AWG_MANAGER_INSTALL_URL" || return 1
+  local url="$AWG_MANAGER_INSTALL_URL" tmp rc=0 min_bytes=8000
+  echo
+  info "Открываем: 11. awg-manager"
+  info "Источник: $url"
+
+  rm -f /tmp/nfqws-remote-*.sh 2>/dev/null || true
+  tmp="/tmp/nfqws-remote-$$.sh"
+  trap 'rm -f /tmp/nfqws-remote-$$.sh 2>/dev/null; _run_remote_sh_restore_traps' EXIT INT TERM
+
+  if ! download_sh_validated "$url" "$tmp" "$min_bytes"; then
+    error "Не удалось скачать целый скрипт: $url"
+    rm -f "$tmp"
+    _run_remote_sh_restore_traps
+    return 1
+  fi
+
+  opkg_kill_others 2>/dev/null || true
+  export PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/bin:/sbin:/usr/bin:/usr/sbin:$PATH"
+  _patch_awg_install_arch "$tmp"
+
+  if [ -c /dev/tty ]; then
+    sh "$tmp" < /dev/tty > /dev/tty 2>&1 || rc=$?
+  else
+    sh "$tmp" || rc=$?
+  fi
+  rm -f "$tmp"
+  _run_remote_sh_restore_traps
+  drain_stdin
+  return "$rc"
 }
 
 menu_keenkit() {
@@ -4879,6 +5000,18 @@ menu_usque_keenetic() {
   refresh_opkg_cache 2>/dev/null || true
 }
 
+# 17. firc — точечная маршрутизация по доменам (FakeIP)
+FIRC_INSTALL_URL="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh"
+
+menu_firc() {
+  # min=2000: installer_firc.sh ~8+ КБ
+  if ! run_menu_remote_sh "17" "firc" "$FIRC_INSTALL_URL" 2000; then
+    error "Установщик firc завершился с ошибкой."
+    return 1
+  fi
+  refresh_opkg_cache 2>/dev/null || true
+}
+
 menu_magitrickle() {
   echo
   info "MagiTrickle"
@@ -5046,6 +5179,17 @@ remove_usque_keenetic() {
   fi
   [ -f /opt/etc/opkg/usque-keenetic.conf ] && rm -f /opt/etc/opkg/usque-keenetic.conf && info "  удалён: /opt/etc/opkg/usque-keenetic.conf"
 }
+
+remove_firc() {
+  if is_installed "firc"; then
+    [ -x /opt/etc/init.d/S99firc ] && /opt/etc/init.d/S99firc stop 2>/dev/null || true
+    opkg remove --autoremove firc 2>/dev/null || opkg remove firc 2>/dev/null || true
+    info "firc удалён."
+  else
+    warn "firc не установлен."
+  fi
+}
+
 
 remove_keenkit() {
   if [ -f /opt/keenkit.sh ]; then
@@ -5476,6 +5620,7 @@ menu_remove() {
   is_awg_manager_installed          && items="$items awg-manager"
   is_tg_ws_proxy_rs_installed       && items="$items tg-ws-proxy-rs"
   is_installed "usque-keenetic"     && items="$items usque-keenetic"
+  is_installed "firc"               && items="$items firc"
   is_installed "magitrickle"        && items="$items magitrickle"
   is_installed "opera-proxy"        && items="$items opera-proxy"
   [ -f /opt/keenkit.sh ]            && items="$items KeenKit"
@@ -5523,6 +5668,7 @@ menu_remove() {
         awg-manager)   remove_awg_manager ;;
         tg-ws-proxy-rs) remove_tg_ws_proxy_rs ;;
         usque-keenetic) remove_usque_keenetic ;;
+        firc)          remove_firc ;;
         magitrickle)   remove_magitrickle ;;
         opera-proxy)   remove_opera_proxy ;;
         KeenKit)       remove_keenkit ;;
@@ -6152,10 +6298,11 @@ _opkg_probe_mirrors_parallel() {
   local ap="$1" has_kd="$2" skip="$3"
   local dir="/tmp/opkg-par-$$" pids="" base i=0 winner="" sz ksz line
   local can_https=0
-  local bases="http://bin.entware.net https://bin.entware.net \
+  # HTTP sw.ext.io первым: без SSL, полный Packages.gz, часто единственный живой за DPI
+  local bases="http://sw.ext.io/entware https://sw.ext.io/entware \
+http://bin.entware.net https://bin.entware.net \
 https://mirrors.bfsu.edu.cn/entware https://mirrors.nju.edu.cn/entware \
-https://mirrors.cqupt.edu.cn/entware https://entware.diversion.ch \
-https://sw.ext.io/entware"
+https://mirrors.cqupt.edu.cn/entware https://entware.diversion.ch"
 
   OPKG_PROBE_WINNER=""
   mkdir -p "$dir" || return 1
@@ -6463,6 +6610,7 @@ service_opkg_fix() {
 
   echo
   info "$LBL_S3"
+  opkg_kill_others
   _opkg_tmp_cleanup
   _opkg_prepare_env 2>/dev/null || true
 
@@ -7000,6 +7148,7 @@ main_menu() {
     echo "      14. MagiTrickle"
     echo "      15. telemt / telemt-panel"
     echo "      16. TG WS Proxy Rust"
+    echo "      17. firc"
     echo
     printf '%s\n' "${CYAN}${BOLD}[::]  ${LBL_REMOVE} [${GREEN}S${CYAN}${BOLD}]  |  ${LBL_LANG} [${GREEN}77${CYAN}${BOLD}]${NC}"
     echo "      88. $LBL_88"
@@ -7033,6 +7182,7 @@ main_menu() {
       14) menu_magitrickle || true ;;
       15) menu_telemt || true ;;
       16) menu_tg_ws_proxy_rs || true ;;
+      17) menu_firc || true ;;
       S|s) menu_service || true ;;
       U|u) opkg_upgrade_all || true ;;
       o|O) menu_opera_hidden || true ;;
