@@ -1,32 +1,42 @@
-cat > /opt/bin/keenkit-vpn <<'KKVPN'
+# kvn 0.0.2 — установка (заменяет keenkit-vpn, его настройки переносятся)
+cat > /opt/bin/kvn <<'KVNEOF'
 #!/bin/sh
-# keenkit-vpn — запуск KeenKit через VPN-интерфейс с раздельными OTA-источниками:
-#   п.5 OTA Update (прошивки)  -> FW_DOMAIN
-#   п.8 KeenBOOT OTA Update     -> KB_BASE
+# kvn (KeenVPN) — запуск KeenKit через VPN-интерфейс с раздельными OTA-источниками:
+#   п.5 OTA Update (прошивки) -> FW_DOMAIN (Афина)
+#   п.8 KeenBOOT OTA Update    -> KB_BASE   (Стас)
 # KeenKit не модифицируется: подменяется только curl через PATH (переживает обновления KeenKit).
 #
 # Использование:
-#   keenkit-vpn              автовыбор рабочего интерфейса из IFACES, запуск KeenKit
-#   keenkit-vpn nwg1         запуск через указанный интерфейс
-#   keenkit-vpn check        диагностика интерфейсов и источников
-#   keenkit-vpn uninstall    удалить keenkit-vpn
-# Настройки: /opt/etc/keenkit-vpn.conf (создаётся при первом запуске)
+#   kvn              автовыбор рабочего интерфейса из IFACES и запуск KeenKit
+#   kvn nwg1         запуск через указанный интерфейс
+#   kvn check        проверка каналов и источников
+#   kvn uninstall    удалить kvn
+# Настройки: /opt/etc/kvn.conf (создаётся при первом запуске)
 
-VERSION="0.0.1"
-CONF="/opt/etc/keenkit-vpn.conf"
-WRAP_DIR="/opt/lib/keenkit-vpn"
+VERSION="0.0.2"
+CONF="/opt/etc/kvn.conf"
+WRAP_DIR="/opt/lib/kvn"
 KK_SCRIPT="/opt/keenkit.sh"
 KK_CONF="/opt/etc/KeenKit.conf"
 REAL_CURL="/opt/bin/curl"
 NET_DIR="/sys/class/net"
 
+# Значения по умолчанию (переопределяются в $CONF)
+IFACES="nwg0 nwg1 nwg2"
+FW_DOMAIN="https://osvault.project-athens.com"
+FW_LABEL="Афина"
+KB_BASE="https://spatiumstas.github.io/KeenKit"
+KB_LABEL="Стас"
+PROBE_URL="https://spatiumstas.github.io/KeenKit/"
+
 RED='\033[1;31m'
 GREEN='\033[1;32m'
 CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 msg() { printf "${CYAN}%s${NC}\n" "$*" >&2; }
-ok() { printf "${GREEN}%s${NC}\n" "$*" >&2; }
+warn() { printf "${YELLOW}%s${NC}\n" "$*" >&2; }
 die() {
   printf "${RED}%s${NC}\n" "$*" >&2
   exit 1
@@ -34,18 +44,19 @@ die() {
 
 write_default_conf() {
   mkdir -p "${CONF%/*}" || die "Не удалось создать ${CONF%/*}"
-  cat >"$CONF" <<'EOF'
-# keenkit-vpn: интерфейсы проверяются по порядку, используется первый рабочий
-IFACES="nwg0 nwg1 nwg2"
+  cat >"$CONF" <<EOF
+# kvn: интерфейсы проверяются по порядку, используется первый рабочий
+IFACES="$IFACES"
 # п.5 OTA Update — прошивки
-FW_DOMAIN="https://osvault.project-athens.com"
+FW_DOMAIN="$FW_DOMAIN"
+FW_LABEL="$FW_LABEL"
 # п.8 KeenBOOT OTA Update — загрузчики
-KB_BASE="https://spatiumstas.github.io/KeenKit"
+KB_BASE="$KB_BASE"
+KB_LABEL="$KB_LABEL"
 # адрес для проверки работоспособности интерфейса
-PROBE_URL="https://spatiumstas.github.io/KeenKit/"
+PROBE_URL="$PROBE_URL"
 EOF
   chmod 600 "$CONF"
-  msg "Создан $CONF"
 }
 
 valid_url() {
@@ -83,21 +94,18 @@ list_ifaces() {
 }
 
 probe_iface() {
-  "$REAL_CURL" --interface "$1" -fsS -m 8 -o /dev/null "$PROBE_URL" 2>/dev/null
+  "$REAL_CURL" --interface "$1" -fsS -m 8 -o /dev/null "$PROBE_URL" >/dev/null 2>&1
 }
 
+# Первый интерфейс из IFACES, через который доступен PROBE_URL. Отсутствующие пропускаются молча.
 pick_iface() {
   for i in $IFACES; do
-    if ! valid_iface "$i"; then
-      msg "  $i: нет интерфейса"
-      continue
-    fi
+    valid_iface "$i" || continue
     if probe_iface "$i"; then
-      ok "  $i: OK"
       echo "$i"
       return 0
     fi
-    msg "  $i: нет доступа к $PROBE_URL"
+    warn "$i: нет доступа к GitHub"
   done
   return 1
 }
@@ -106,7 +114,7 @@ write_wrapper() {
   mkdir -p "$WRAP_DIR" || die "Не удалось создать $WRAP_DIR"
   cat >"$WRAP_DIR/curl.tmp" <<'WRAP'
 #!/bin/sh
-# Сгенерировано keenkit-vpn, изменения будут перезаписаны.
+# Сгенерировано kvn, изменения будут перезаписаны.
 # Внешние запросы -> через $KK_IFACE; $KK_FW/files/keenboot/* -> $KK_KB/files/keenboot/*;
 # локальный RCI (127.0.0.1/localhost) -> напрямую.
 REAL=/opt/bin/curl
@@ -133,12 +141,14 @@ WRAP
   fi
 }
 
+kk_domain() {
+  sed -n 's/^domain="\([^"]*\)"$/\1/p' "$KK_CONF" 2>/dev/null
+}
+
 set_kk_domain() {
-  if [ "$(sed -n 's/^domain="\([^"]*\)"$/\1/p' "$KK_CONF" 2>/dev/null)" != "$FW_DOMAIN" ]; then
-    if ! { mkdir -p "${KK_CONF%/*}" && printf 'domain="%s"\n' "$FW_DOMAIN" >"$KK_CONF"; }; then
-      die "Не удалось записать $KK_CONF"
-    fi
-    msg "Домен OTA в $KK_CONF: $FW_DOMAIN"
+  [ "$(kk_domain)" = "$FW_DOMAIN" ] && return 0
+  if ! { mkdir -p "${KK_CONF%/*}" && printf 'domain="%s"\n' "$FW_DOMAIN" >"$KK_CONF"; }; then
+    die "Не удалось записать $KK_CONF"
   fi
 }
 
@@ -148,11 +158,11 @@ cmd_run() {
     valid_iface "$1" || die "Интерфейс $1 не найден. Есть: $(list_ifaces)"
     IFACES="$1"
   fi
-  msg "Проверка интерфейсов ($IFACES):"
-  iface=$(pick_iface) || die "Нет рабочего интерфейса. Запусти: keenkit-vpn check"
+  iface=$(pick_iface) || die "Нет рабочего интерфейса ($IFACES). Проверка: kvn check"
   write_wrapper
   set_kk_domain
-  ok "KeenKit через $iface | прошивки: $FW_DOMAIN | KeenBOOT: $KB_BASE"
+  printf "${CYAN}Прошивки:${NC} ${GREEN}%s${NC}  ${CYAN}KeenBOOT:${NC} ${GREEN}%s${NC}  ${CYAN}Интерфейс:${NC} ${GREEN}%s${NC}\n" \
+    "$FW_LABEL" "$KB_LABEL" "$iface"
   KK_IFACE="$iface" KK_FW="$FW_DOMAIN" KK_KB="$KB_BASE" PATH="$WRAP_DIR:$PATH" \
     exec sh "$KK_SCRIPT"
 }
@@ -161,28 +171,51 @@ http_code() {
   "$REAL_CURL" "$@" -sS -m 10 -o /dev/null -w '%{http_code}' 2>/dev/null || true
 }
 
+status() {
+  case "$1" in
+  2??) printf '%bOK%b' "$GREEN" "$NC" ;;
+  000 | "") printf '%bнет%b' "$RED" "$NC" ;;
+  *) printf "${RED}%s${NC}" "$1" ;;
+  esac
+}
+
+# check_row <имя> [параметры curl] — IP выхода и доступность источников через канал
+check_row() {
+  name="$1"
+  shift
+  ip=$("$REAL_CURL" "$@" -fsS -m 10 https://api.ipify.org 2>/dev/null) || ip="нет связи"
+  printf "%s (%s): KeenBOOT " "$name" "$ip"
+  status "$(http_code "$@" "$PROBE_URL")"
+  printf ", прошивки "
+  status "$(http_code "$@" "$FW_DOMAIN/osvault/")"
+  printf '\n'
+}
+
 cmd_check() {
   [ -x "$REAL_CURL" ] || die "Нет $REAL_CURL"
-  echo "keenkit-vpn $VERSION"
-  echo "Прошивки: $FW_DOMAIN | KeenBOOT: $KB_BASE"
-  echo "KeenKit.conf: $(cat "$KK_CONF" 2>/dev/null || echo 'нет')"
-  echo "Напрямую: GitHub=$(http_code "$PROBE_URL") osvault=$(http_code "$FW_DOMAIN/osvault/")"
+  printf "${CYAN}kvn %s${NC}\n" "$VERSION"
+  printf "Прошивки (%s): %s\n" "$FW_LABEL" "$FW_DOMAIN"
+  printf "KeenBOOT (%s):   %s\n" "$KB_LABEL" "$KB_BASE"
+  if [ "$(kk_domain)" = "$FW_DOMAIN" ]; then
+    printf 'KeenKit.conf:     %bOK%b\n' "$GREEN" "$NC"
+  else
+    printf "KeenKit.conf:     ${YELLOW}%s${NC} (исправится при запуске kvn)\n" "$(kk_domain | grep . || echo 'не задан')"
+  fi
+  printf '\n'
+  check_row "напрямую"
   for i in $IFACES; do
-    if ! valid_iface "$i"; then
-      echo "$i: нет интерфейса"
-      continue
-    fi
-    ip=$("$REAL_CURL" --interface "$i" -fsS -m 10 https://api.ipify.org 2>/dev/null) || ip="нет"
-    echo "$i: IP=$ip GitHub=$(http_code --interface "$i" "$PROBE_URL") osvault=$(http_code --interface "$i" "$FW_DOMAIN/osvault/")"
+    valid_iface "$i" && check_row "$i" --interface "$i"
   done
+  return 0
 }
 
 cmd_uninstall() {
-  printf "Удалить keenkit-vpn (%s, %s, %s)? (y/n) " "$WRAP_DIR" "$CONF" "$0"
+  printf "Удалить kvn (%s, %s, %s)? (y/n) " "$WRAP_DIR" "$CONF" "$0"
   read -r answer || exit 1
   case "$answer" in
   y | Y)
-    rm -rf "$WRAP_DIR" "$CONF" && rm -f "$0" && ok "Удалено. KeenKit.conf не тронут."
+    rm -rf "$WRAP_DIR" "$CONF" && rm -f "$0" &&
+      printf '%bУдалено. KeenKit.conf не тронут.%b\n' "$GREEN" "$NC"
     ;;
   *) msg "Отменено" ;;
   esac
@@ -194,8 +227,11 @@ case "${1:-}" in
 check) load_conf && cmd_check ;;
 uninstall) cmd_uninstall ;;
 "") load_conf && cmd_run "" ;;
--*) die "Неизвестный параметр: $1 (keenkit-vpn --help)" ;;
+-*) die "Неизвестный параметр: $1 (kvn --help)" ;;
 *) load_conf && cmd_run "$1" ;;
 esac
-KKVPN
-chmod 755 /opt/bin/keenkit-vpn && keenkit-vpn check
+KVNEOF
+chmod 755 /opt/bin/kvn
+if [ -f /opt/etc/keenkit-vpn.conf ] && [ ! -f /opt/etc/kvn.conf ]; then mv /opt/etc/keenkit-vpn.conf /opt/etc/kvn.conf; fi
+rm -rf /opt/lib/keenkit-vpn /opt/bin/keenkit-vpn /opt/etc/keenkit-vpn.conf
+kvn check
