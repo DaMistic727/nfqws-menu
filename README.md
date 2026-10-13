@@ -4,7 +4,7 @@
 
 Репозиторий также служит хранилищем готовых **стратегий** обхода DPI, **blobs** и **lists**.
 
-- Скрипт: [`nfqws-menu.sh`](nfqws-menu.sh) (текущая версия **0.9.83**)
+- Скрипт: [`nfqws-menu.sh`](nfqws-menu.sh) (текущая версия **0.10.1**)
 - Стратегии: [`strategies/`](strategies/)
 - Hosts: [`hosts`](hosts)
 - Контрольные суммы: [`SHA256SUMS`](SHA256SUMS), [`strategies/blobs/SHA256SUMS`](strategies/blobs/SHA256SUMS)
@@ -447,6 +447,10 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 ---
 
 ## Changelog
+
+### 0.10.1
+
+- Нумерация версии: переход на линейку **0.10.x** (MINOR после серии 0.9.x).
 
 ### 0.9.84
 

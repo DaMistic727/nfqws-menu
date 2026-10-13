@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.9.86"
+SCRIPT_VERSION="0.10.1"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -683,14 +683,12 @@ run_remote_sh() {
 # Единый формат пункта меню → удалённый установщик:
 #   [+] Открываем: 11. awg-manager
 #   [+] Источник: https://...
-#   ================================================
 # $1=номер  $2=название  $3=url  [$4=min_bytes]
 run_menu_remote_sh() {
   local num="$1" name="$2" url="$3" min_bytes="${4:-8000}"
   echo
   info "Открываем: ${num}. ${name}"
   info "Источник: $url"
-  printf '%s\n' "================================================"
   run_remote_sh "$url" "$min_bytes"
 }
 
@@ -4205,7 +4203,6 @@ menu_awg_manager() {
   echo
   info "Открываем: 11. awg-manager"
   info "Источник: $url"
-  printf '%s\n' "================================================"
 
   rm -f /tmp/nfqws-remote-*.sh 2>/dev/null || true
   tmp="/tmp/nfqws-remote-$$.sh"
