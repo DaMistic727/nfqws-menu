@@ -1403,29 +1403,65 @@ ask_web_install() {
 install_nfqws1() {
   need_arch || return 1
   info "Установка nfqws-keenetic (версия 1)..."
+  if is_installed "nfqws2-keenetic"; then
+    warn "Обнаружен nfqws2-keenetic. Пакеты конфликтуют — nfqws-keenetic нельзя ставить вместе с nfqws2."
+    if confirm_no "Удалить nfqws2-keenetic (и веб-интерфейс) перед установкой nfqws-keenetic?"; then
+      stop_nfqws2_hard
+      opkg remove nfqws-keenetic-web nfqws2-keenetic 2>/dev/null || true
+      stop_nfqws2_hard
+      refresh_opkg_cache
+    else
+      warn "Установка nfqws-keenetic отменена (nfqws2-keenetic остаётся)."
+      return 1
+    fi
+  fi
   install_deps
   ensure_opkg_repo "nfqws-keenetic" "https://nfqws.github.io/nfqws-keenetic/$ARCH"
-  opkg install nfqws-keenetic
-  info "nfqws-keenetic установлен."
-  ask_web_install
+  if opkg install nfqws-keenetic; then
+    refresh_opkg_cache
+    if is_installed "nfqws-keenetic"; then
+      info "nfqws-keenetic установлен."
+      ask_web_install
+    else
+      error "opkg не сообщил об ошибке, но пакет nfqws-keenetic не установлен."
+      return 1
+    fi
+  else
+    error "Не удалось установить nfqws-keenetic (конфликт или ошибка opkg)."
+    return 1
+  fi
 }
 
 install_nfqws2() {
   need_arch || return 1
   info "Установка nfqws2-keenetic (версия 2)..."
   if is_installed "nfqws-keenetic"; then
-    warn "Обнаружен nfqws-keenetic. Рекомендуется удалить его перед установкой nfqws2."
-    if confirm_no "Удалить nfqws-keenetic и веб-интерфейс?"; then
+    warn "Обнаружен nfqws-keenetic. Пакеты конфликтуют — nfqws2 нельзя ставить вместе с nfqws-keenetic."
+    if confirm_no "Удалить nfqws-keenetic (и веб-интерфейс) перед установкой nfqws2?"; then
       stop_nfqws1_hard
       opkg remove nfqws-keenetic-web nfqws-keenetic 2>/dev/null || true
       stop_nfqws1_hard
+      refresh_opkg_cache
+    else
+      warn "Установка nfqws2-keenetic отменена (nfqws-keenetic остаётся)."
+      return 1
     fi
   fi
   install_deps
   ensure_opkg_repo "nfqws2-keenetic" "https://nfqws.github.io/nfqws2-keenetic/$ARCH"
-  opkg install nfqws2-keenetic
-  info "nfqws2-keenetic установлен."
-  ask_web_install
+  if opkg install nfqws2-keenetic; then
+    refresh_opkg_cache
+    if is_installed "nfqws2-keenetic"; then
+      info "nfqws2-keenetic установлен."
+      ask_web_install
+    else
+      error "opkg не сообщил об ошибке, но пакет nfqws2-keenetic не установлен."
+      return 1
+    fi
+  else
+    error "Не удалось установить nfqws2-keenetic (конфликт или ошибка opkg)."
+    return 1
+  fi
 }
 
 # Суффикс архитектуры в имени .ipk
@@ -1716,17 +1752,33 @@ menu_install_ipk_direct() {
   case "$choice" in
     1)
       [ "$v1" = "?" ] && { error "Версия nfqws-keenetic неизвестна."; return 1; }
+      if is_installed "nfqws2-keenetic"; then
+        warn "Обнаружен nfqws2-keenetic. Пакеты конфликтуют — nfqws-keenetic нельзя ставить вместе с nfqws2."
+        if confirm_no "Удалить nfqws2-keenetic (и веб-интерфейс) перед установкой nfqws-keenetic?"; then
+          stop_nfqws2_hard
+          opkg remove nfqws-keenetic-web nfqws2-keenetic 2>/dev/null || true
+          stop_nfqws2_hard
+          refresh_opkg_cache
+        else
+          warn "Установка nfqws-keenetic отменена (nfqws2-keenetic остаётся)."
+          return 1
+        fi
+      fi
       install_ipk_from_repo "nfqws-keenetic" "nfqws-keenetic" "$base1" "$v1" || return 1
       ask_web_install
       ;;
     2)
       [ "$v2" = "?" ] && { error "Версия nfqws2-keenetic неизвестна."; return 1; }
       if is_installed "nfqws-keenetic"; then
-        warn "Обнаружен nfqws-keenetic. Рекомендуется удалить его перед установкой nfqws2."
-        if confirm_no "Удалить nfqws-keenetic и веб-интерфейс?"; then
+        warn "Обнаружен nfqws-keenetic. Пакеты конфликтуют — nfqws2 нельзя ставить вместе с nfqws-keenetic."
+        if confirm_no "Удалить nfqws-keenetic (и веб-интерфейс) перед установкой nfqws2?"; then
           stop_nfqws1_hard
           opkg remove nfqws-keenetic-web nfqws-keenetic 2>/dev/null || true
           stop_nfqws1_hard
+          refresh_opkg_cache
+        else
+          warn "Установка nfqws2-keenetic отменена (nfqws-keenetic остаётся)."
+          return 1
         fi
       fi
       install_ipk_from_repo "nfqws2-keenetic" "nfqws2-keenetic" "$base2" "$v2" || return 1
