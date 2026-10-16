@@ -1,10 +1,12 @@
 #!/bin/sh
 # installer_firc.sh — меню firc для Entware (Keenetic / Netcraze)
-# Репозиторий пакета: https://github.com/hoaxisr/firc
+# Пакет: https://github.com/hoaxisr/firc
+# Репозиторий opkg: http://repo.hoaxisr.ru/
 # Обёртка: https://github.com/rndnaame/nfqws-menu
 #
-# 1) Установка firc (ipk с GitHub Releases)
+# 1) Установка firc (opkg из repo.hoaxisr.ru)
 # 2) Удаление firc
+# 3) Диагностика
 #
 # Запуск:
 #   sh installer_firc.sh
@@ -25,13 +27,18 @@ warn()  { printf '%s\n' "${YELLOW}[!]${NC} $*"; }
 error() { printf '%s\n' "${RED}[!]${NC} $*"; }
 
 PKG_NAME="firc"
-GITHUB_REPO="hoaxisr/firc"
+REPO_BASE="http://repo.hoaxisr.ru"
+# https fallback, если HTTP режут
+REPO_BASE_HTTPS="https://repo.hoaxisr.ru"
+# как в https://repo.hoaxisr.ru/ — общий фид hoaxisr (firc, awg-manager, …)
+OPKG_CONF="/opt/etc/opkg/awg_manager.conf"
+OPKG_FEED_NAME="hoaxisr"
 INIT_SCRIPT="/opt/etc/init.d/S99firc"
 CONF_DIR="/opt/etc/firc"
-TMPDIR="/tmp/firc-installer-$$"
+GITHUB_REPO="hoaxisr/firc"
 
 # ---------------------------------------------------------------------------
-# Архитектура — логика как в nfqws-menu.sh / installer_usque.sh
+# Архитектура — как в nfqws-menu.sh / installer_usque.sh
 # ---------------------------------------------------------------------------
 ARCH=""
 ARCH_RAW=""
@@ -138,12 +145,12 @@ detect_arch() {
   fi
 }
 
-# ARCH меню → суффикс ipk (entware_*_kn)
-arch_to_ipk_suffix() {
+# ARCH → путь в repo.hoaxisr.ru (aarch64-k3.10 | mipsel-k3.4 | mips-k3.4)
+arch_to_repo_path() {
   case "$1" in
-    aarch64) echo "aarch64-3.10" ;;
-    mipsel)  echo "mipsel-3.4" ;;
-    mips)    echo "mips-3.4" ;;
+    aarch64) echo "aarch64-k3.10" ;;
+    mipsel)  echo "mipsel-k3.4" ;;
+    mips)    echo "mips-k3.4" ;;
     *)       echo "" ;;
   esac
 }
@@ -178,20 +185,6 @@ is_pkg_installed() {
 
 installed_version() {
   opkg list-installed 2>/dev/null | sed -n "s/^${PKG_NAME} - //p" | head -1
-}
-
-http_get() {
-  # http_get URL DEST
-  url="$1"
-  dest="$2"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$dest"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$dest" -T 180 "$url"
-  else
-    error "Нужны curl или wget."
-    return 1
-  fi
 }
 
 http_get_stdout() {
@@ -229,44 +222,35 @@ pause() {
 }
 
 # ---------------------------------------------------------------------------
-# Версии с GitHub Releases
+# Версия из Packages репозитория
 # ---------------------------------------------------------------------------
-LATEST_TAG=""   # 0.3.0
-LATEST_IPK=""   # firc_0.3.0-1_entware_..._kn.ipk (имя ассета)
+LATEST_TAG=""
 
 fetch_latest() {
   LATEST_TAG=""
-  LATEST_IPK=""
   need_arch 2>/dev/null || true
   [ -n "$ARCH" ] || return 0
+  path=$(arch_to_repo_path "$ARCH")
+  [ -n "$path" ] || return 0
 
-  suffix=$(arch_to_ipk_suffix "$ARCH")
-  [ -n "$suffix" ] || return 0
-
-  # 1) redirect releases/latest → tag
-  tag=""
-  if command -v curl >/dev/null 2>&1; then
-    tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-      "https://github.com/${GITHUB_REPO}/releases/latest" 2>/dev/null \
-      | sed 's|.*/||' | tr -d '\r\n')
-  fi
-  if [ -z "$tag" ] || [ "$tag" = "latest" ]; then
-    # 2) HTML releases page
-    page=$(http_get_stdout "https://github.com/${GITHUB_REPO}/releases" 2>/dev/null) || page=""
-    tag=$(printf '%s' "$page" | sed -n 's|.*href="/'"${GITHUB_REPO}"'/releases/tag/\([^"]*\)".*|\1|p' | head -1)
-  fi
-  tag=$(printf '%s' "$tag" | sed 's/^v//')
-  [ -n "$tag" ] || return 0
-  LATEST_TAG="$tag"
-
-  # имя ассета: firc_<tag>-N_entware_<suffix>_kn.ipk (ревизия обычно 1)
-  # пробуем -1; если expanded_assets доступен — уточняем
-  assets=$(http_get_stdout "https://github.com/${GITHUB_REPO}/releases/expanded_assets/${tag}" 2>/dev/null) || assets=""
-  name=$(printf '%s' "$assets" | sed -n "s|.*\(firc_${tag}-[0-9]*_entware_${suffix}_kn\.ipk\).*|\1|p" | head -1)
-  if [ -z "$name" ]; then
-    name="firc_${tag}-1_entware_${suffix}_kn.ipk"
-  fi
-  LATEST_IPK="$name"
+  for base in "$REPO_BASE" "$REPO_BASE_HTTPS"; do
+    pkg=$(http_get_stdout "${base}/${path}/Packages" 2>/dev/null) || pkg=""
+    if [ -z "$pkg" ]; then
+      # иногда отдают Packages.gz
+      if command -v curl >/dev/null 2>&1; then
+        pkg=$(curl -fsSL --connect-timeout 10 --max-time 30 "${base}/${path}/Packages.gz" 2>/dev/null | gzip -dc 2>/dev/null) || pkg=""
+      fi
+    fi
+    ver=$(printf '%s\n' "$pkg" | awk '
+      $1=="Package:" && $2=="firc" {inpkg=1; next}
+      inpkg && $1=="Version:" {print $2; exit}
+      inpkg && $1=="Package:" {exit}
+    ')
+    if [ -n "$ver" ]; then
+      LATEST_TAG="$ver"
+      return 0
+    fi
+  done
 }
 
 fmt_latest() {
@@ -291,84 +275,160 @@ show_status() {
   fi
 }
 
+# Старые NDMS 2.x / Keenetic II — firc не рассчитан
+warn_old_platform() {
+  ver=""
+  if command -v ndmc >/dev/null 2>&1; then
+    ver=$(ndmc -c show version 2>/dev/null | head -5)
+  fi
+  kver=$(uname -r 2>/dev/null || true)
+  model=$(cat /proc/device-tree/model 2>/dev/null || true)
+  [ -z "$model" ] && model=$(grep -i 'machine\|Hardware' /proc/cpuinfo 2>/dev/null | head -1)
+
+  old=0
+  case "$kver" in
+    2.*|3.0*|3.1*|3.2*|3.3*) old=1 ;;
+  esac
+  case "$model" in
+    *kn_rb*|*KN-RB*|*Keenetic_II*|*KeeneticII*) old=1 ;;
+  esac
+  echo "$ver $model $kver" | grep -qiE 'kn_rb|keenetic.?ii|ndms[[:space:]]*2\.|release.*2\.(0|1[0-6])' && old=1
+
+  if [ "$old" = 1 ]; then
+    echo
+    warn "Похоже на старую платформу (ядро ${kver:-?}; NDMS 2.x / Keenetic II / kn_rb)."
+    warn "firc (_kn) рассчитан на KeeneticOS 3+/4+/5+ + Entware (ядро ≥ 3.4, netfilter.d, RCI)."
+    warn "На NDMS 2.16 демон обычно не стартует — ограничение платформы."
+    echo
+  fi
+}
+
+diagnose_firc() {
+  echo
+  printf '%s\n' "${BOLD}Диагностика firc${NC}"
+  warn_old_platform
+
+  if [ -x /opt/bin/fircd ]; then
+    info "Бинарник: /opt/bin/fircd"
+  else
+    error "Нет /opt/bin/fircd — пакет не распакован."
+    return 1
+  fi
+
+  if command -v ldd >/dev/null 2>&1; then
+    miss=$(ldd /opt/bin/fircd 2>/dev/null | grep -i 'not found' || true)
+    if [ -n "$miss" ]; then
+      error "Не хватает библиотек:"
+      printf '%s\n' "$miss"
+    else
+      info "ldd: все библиотеки найдены."
+    fi
+  fi
+
+  if ! command -v socat >/dev/null 2>&1; then
+    error "socat не найден (Depends пакета)."
+  else
+    info "socat: $(command -v socat)"
+  fi
+
+  [ -f /opt/etc/firc/firc.conf ] && info "Конфиг: /opt/etc/firc/firc.conf" || error "Нет firc.conf"
+  [ -f /opt/etc/firc/groups.yaml ] && info "Группы: /opt/etc/firc/groups.yaml" || warn "Нет groups.yaml"
+
+  echo
+  printf '%s\n' "${DIM}logread | grep -i firc${NC}"
+  echo "  /opt/etc/init.d/S99firc restart"
+  echo "  /opt/etc/init.d/S99firc status"
+  return 0
+}
+
+# Прописать src/gz hoaxisr URL в awg_manager.conf (не затирая прочие строки)
+ensure_hoaxisr_repo() {
+  repo_url="$1"
+  mkdir -p /opt/etc/opkg
+  line="src/gz ${OPKG_FEED_NAME} ${repo_url}"
+
+  if [ -f "$OPKG_CONF" ]; then
+    # обновить существующую строку src/gz hoaxisr или дописать
+    tmp="${OPKG_CONF}.$$"
+    awk -v feed="$OPKG_FEED_NAME" -v newline="$line" '
+      BEGIN { done = 0 }
+      $1 == "src/gz" && $2 == feed {
+        if (!done) { print newline; done = 1 }
+        next
+      }
+      { print }
+      END { if (!done) print newline }
+    ' "$OPKG_CONF" > "$tmp" && mv "$tmp" "$OPKG_CONF"
+  else
+    printf '%s\n' "$line" > "$OPKG_CONF"
+  fi
+  info "Репозиторий: $repo_url"
+  info "Записан: $OPKG_CONF ($line)"
+}
+
 # ---------------------------------------------------------------------------
-# 1) Установка
+# 1) Установка через opkg-репозиторий repo.hoaxisr.ru
+#    src/gz hoaxisr → /opt/etc/opkg/awg_manager.conf (как на сайте репо)
 # ---------------------------------------------------------------------------
 do_install() {
   echo
-  info "Установка $PKG_NAME (GitHub Releases)"
+  info "Установка $PKG_NAME (repo.hoaxisr.ru)"
   need_arch || return 1
+  warn_old_platform
 
-  suffix=$(arch_to_ipk_suffix "$ARCH")
-  if [ -z "$suffix" ]; then
-    error "Нет ipk для ARCH=$ARCH."
+  path=$(arch_to_repo_path "$ARCH")
+  if [ -z "$path" ]; then
+    error "Нет фида для ARCH=$ARCH."
     return 1
   fi
 
-  fetch_latest
-  if [ -z "$LATEST_TAG" ] || [ -z "$LATEST_IPK" ]; then
-    error "Не удалось определить последнюю версию на GitHub."
-    return 1
-  fi
+  repo_url="${REPO_BASE}/${path}"
+  ensure_hoaxisr_repo "$repo_url"
 
-  url="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_TAG}/${LATEST_IPK}"
-  info "ARCH=$ARCH ($ARCH_SOURCE) → $LATEST_IPK"
-  info "URL: $url"
-
-  mkdir -p "$TMPDIR"
-  ipk="$TMPDIR/$LATEST_IPK"
-  if ! http_get "$url" "$ipk"; then
-    error "Скачивание не удалось."
-    rm -rf "$TMPDIR"
-    return 1
-  fi
-
-  sz=$(wc -c < "$ipk" 2>/dev/null | tr -d ' ')
-  if [ -z "$sz" ] || [ "$sz" -lt 10000 ]; then
-    error "Файл слишком маленький (${sz:-0} байт) — возможно, обрыв или 404."
-    rm -rf "$TMPDIR"
-    return 1
-  fi
-  info "Скачано: $sz байт"
-
-  # зависимости (README: socat)
-  if ! opkg list-installed 2>/dev/null | grep -q '^socat '; then
-    info "Установка зависимости socat..."
-    opkg update 2>/dev/null || true
-    opkg install socat 2>/dev/null || warn "socat не установлен (пакет может потребовать его)."
-  fi
-
-  if is_pkg_installed; then
-    info "Пакет уже установлен — переустановка..."
-    if ! opkg install --force-reinstall "$ipk"; then
-      # fallback без force
-      if ! opkg install "$ipk"; then
-        error "opkg install не удался."
-        rm -rf "$TMPDIR"
-        return 1
-      fi
-    fi
-  else
-    if ! opkg install "$ipk"; then
-      error "opkg install не удался."
-      rm -rf "$TMPDIR"
+  if ! opkg update; then
+    warn "opkg update по HTTP не удался — пробуем HTTPS..."
+    repo_url="${REPO_BASE_HTTPS}/${path}"
+    ensure_hoaxisr_repo "$repo_url"
+    if ! opkg update; then
+      error "opkg update не удался. Проверьте сеть / DNS / DPI."
       return 1
     fi
   fi
 
-  rm -rf "$TMPDIR"
-  info "Установка завершена: $(installed_version)"
-
-  if [ -x "$INIT_SCRIPT" ]; then
-    info "Запуск сервиса..."
-    "$INIT_SCRIPT" start 2>/dev/null || "$INIT_SCRIPT" restart 2>/dev/null || \
-      warn "Не удалось запустить $INIT_SCRIPT"
+  # Conflicts: отдельный пакет tunvless
+  if opkg list-installed 2>/dev/null | grep -q '^tunvless '; then
+    warn "Пакет tunvless конфликтует с firc — удаляем..."
+    opkg remove tunvless 2>/dev/null || true
   fi
+
+  install_rc=0
+  if is_pkg_installed; then
+    info "Пакет уже установлен — обновление..."
+    opkg upgrade "$PKG_NAME" || opkg install "$PKG_NAME" || install_rc=$?
+  else
+    info "opkg install $PKG_NAME"
+    opkg install "$PKG_NAME" || install_rc=$?
+  fi
+
+  # postinst стартует демон; на несовместимой прошивке → exit 1
+  if [ "$install_rc" -ne 0 ]; then
+    warn "opkg install/upgrade код $install_rc (часто postinst: демон не стартовал)."
+    if [ -x /opt/bin/fircd ]; then
+      diagnose_firc
+      error "Файлы на месте, но демон не запустился."
+      return 1
+    fi
+    error "opkg install $PKG_NAME не удался."
+    return 1
+  fi
+
+  info "Установка завершена: $(installed_version)"
 
   echo
   printf '%s\n' "${BOLD}Управление${NC}"
   echo "  $INIT_SCRIPT  (start | stop | restart | status)"
-  echo "  WebUI: обычно порт 666 (см. настройки после первого запуска)"
+  echo "  WebUI: http://<IP-роутера>:666  (логин — системный account)"
+  printf '%s\n' "${DIM}Репозиторий: ${repo_url}${NC}"
   printf '%s\n' "${DIM}Документация: https://github.com/${GITHUB_REPO}${NC}"
   return 0
 }
@@ -407,12 +467,13 @@ do_remove() {
     info "Пакет удалён через opkg."
   fi
 
+  # awg_manager.conf общий с awg-manager — не удаляем файл целиком
+
   if [ "$remove_conf" = "1" ] && [ -d "$CONF_DIR" ]; then
     rm -rf "$CONF_DIR"
     info "  удалён каталог: $CONF_DIR"
   fi
 
-  # init мог остаться
   if [ -f "$INIT_SCRIPT" ] && ! is_pkg_installed; then
     rm -f "$INIT_SCRIPT"
     info "  удалён: $INIT_SCRIPT"
@@ -437,14 +498,15 @@ main_menu() {
     printf '%s\n' "${DIM}Заворачивает нужные домены в выбранный интерфейс${NC}"
     printf '%s\n' "${DIM}(VPN / туннель), не трогая остальной трафик.${NC}"
     echo
-    printf '%s\n' "${DIM}пакет: hoaxisr/firc (GitHub Releases, ipk)${NC}"
-    printf '%s\n' "${DIM}(Entware / Keenetic; aarch64, mipsel, mips)${NC}"
+    printf '%s\n' "${DIM}пакет: src/gz hoaxisr → repo.hoaxisr.ru (opkg)${NC}"
+    printf '%s\n' "${DIM}(KeeneticOS 4+/5+; aarch64, mipsel, mips)${NC}"
     echo
     show_status
     fetch_latest 2>/dev/null || true
     echo
     printf '  1) Установка firc%s\n' "$(fmt_latest)"
     echo "  2) Удаление firc"
+    echo "  3) Диагностика (почему не стартует)"
     echo "  0) Выход"
     echo
     printf '%s' "${BOLD}Выбор: ${NC}"
@@ -453,6 +515,7 @@ main_menu() {
     case "$choice" in
       1) do_install; pause ;;
       2) do_remove; pause ;;
+      3) diagnose_firc; pause ;;
       0|"") info "Выход."; exit 0 ;;
       *) warn "Неверный пункт"; pause ;;
     esac
