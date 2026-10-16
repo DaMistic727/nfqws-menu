@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.10.2"
+SCRIPT_VERSION="0.10.4"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -4969,10 +4969,10 @@ menu_usque_keenetic() {
 }
 
 # 17. firc — точечная маршрутизация по доменам (FakeIP)
+# Установка только через installer_firc.sh (repo.hoaxisr.ru → opkg install firc)
 FIRC_INSTALL_URL="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh"
 
 menu_firc() {
-  # min=2000: installer_firc.sh ~8+ КБ
   if ! run_menu_remote_sh "17" "firc" "$FIRC_INSTALL_URL" 2000; then
     error "Установщик firc завершился с ошибкой."
     return 1

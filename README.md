@@ -404,10 +404,9 @@ Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
 curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh | sh
 ```
 
-1. **Установка firc** — как на [repo.hoaxisr.ru](https://repo.hoaxisr.ru/):
-   `src/gz hoaxisr http://repo.hoaxisr.ru/{aarch64-k3.10|mipsel-k3.4|mips-k3.4}` → `/opt/etc/opkg/awg_manager.conf`, затем `opkg update && opkg install firc` (Depends тянет opkg)
-2. **Удаление firc** — `opkg remove` + опционально `/opt/etc/firc` (`awg_manager.conf` не трогаем — общий с awg-manager)
-3. **Диагностика** — если демон не стартует
+1. **Установка / обновление firc** — `src/gz hoaxisr` → `/opt/etc/opkg/awg_manager.conf` ([repo.hoaxisr.ru](https://repo.hoaxisr.ru/)), затем **`opkg update && opkg install firc`**
+2. **Удаление firc** — `opkg remove` (`awg_manager.conf` не трогаем)
+3. **Полное меню** — remote `installer_firc.sh` (диагностика и т.п.)
 
 - Init: `/opt/etc/init.d/S99firc` (start | stop | restart | status)
 - WebUI: обычно порт **666**
@@ -450,6 +449,14 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 ---
 
 ## Changelog
+
+### 0.10.4
+
+- **п. 17 firc** — снова только remote `installer_firc.sh` (без встраивания логики в меню)
+
+### 0.10.3
+
+- (отменено в 0.10.4) попытка inline-установки firc в меню
 
 ### 0.10.2
 
