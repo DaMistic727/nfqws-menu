@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.10.4"
+SCRIPT_VERSION="0.10.5"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5960,15 +5960,54 @@ _opkg_print_probe() {
   fi
 }
 
+# Из URL вернуть только валидный arch-path (aarch64-k3.10 / mipselsf-k3.4 …).
+# «…/entware» или «…/keenetic» без arch → пусто (не «entware»!).
 _opkg_arch_path_from_url() {
-  local u="${1%/}" last="${1%/}"
+  local u="${1%/}" last
   last="${u##*/}"
   if [ "$last" = "keenetic" ]; then
     u="${u%/*}"
-    printf '%s\n' "${u##*/}"
-  else
-    printf '%s\n' "$last"
+    last="${u##*/}"
   fi
+  case "$last" in
+    aarch64-k3.10|mipselsf-k3.4|mipssf-k3.4|x64-k3.2|x86-k2.6|armv7sf-k3.2)
+      printf '%s\n' "$last"
+      ;;
+    aarch64*|arm64*)
+      printf '%s\n' "aarch64-k3.10"
+      ;;
+    mipselsf*|mipsel*)
+      printf '%s\n' "mipselsf-k3.4"
+      ;;
+    mipssf*|mips-k*|mips3*)
+      printf '%s\n' "mipssf-k3.4"
+      ;;
+  esac
+}
+
+# База зеркала без arch: …/aarch64-k3.10 → … ; …/entware → …/entware
+_opkg_base_from_url() {
+  local u="${1%/}" last
+  last="${u##*/}"
+  if [ "$last" = "keenetic" ]; then
+    u="${u%/*}"
+    last="${u##*/}"
+  fi
+  case "$last" in
+    aarch64-k3.10|mipselsf-k3.4|mipssf-k3.4|x64-k3.2|x86-k2.6|armv7sf-k3.2|aarch64*|mipsel*|mipssf*|mips-k*)
+      printf '%s\n' "${u%/*}"
+      ;;
+    *)
+      printf '%s\n' "$u"
+      ;;
+  esac
+}
+
+_opkg_arch_path_ok() {
+  case "$1" in
+    aarch64-k3.10|mipselsf-k3.4|mipssf-k3.4|x64-k3.2|x86-k2.6|armv7sf-k3.2) return 0 ;;
+  esac
+  return 1
 }
 
 _opkg_arch_path_fallback() {
@@ -6601,27 +6640,37 @@ service_opkg_fix() {
     case "$line" in
       src/gz\ *)
         printf '  %s\n' "$line"
-        # shellcheck: name + url
         name=$(printf '%s\n' "$line" | awk '{print $2}')
         url=$(printf '%s\n' "$line" | awk '{print $3}')
         [ -n "$url" ] || continue
-        if [ -z "$arch_path" ]; then
+        # arch только из валидного сегмента (не «entware»)
+        if ! _opkg_arch_path_ok "$arch_path"; then
           arch_path=$(_opkg_arch_path_from_url "$url")
         fi
         case "$name" in
-          keendev) has_keendev=1 ;;
+          keendev)
+            has_keendev=1
+            # keendev часто …/aarch64-k3.10/keenetic — надёжный источник arch
+            if ! _opkg_arch_path_ok "$arch_path"; then
+              arch_path=$(_opkg_arch_path_from_url "$url")
+            fi
+            ;;
           entware)
-            [ -n "$arch_path" ] || arch_path=$(_opkg_arch_path_from_url "$url")
-            cur_base=$(printf '%s\n' "$url" | sed "s|/${arch_path}/*$||")
+            cur_base=$(_opkg_base_from_url "$url")
+            if ! _opkg_arch_path_ok "$arch_path"; then
+              arch_path=$(_opkg_arch_path_from_url "$url")
+            fi
             ;;
         esac
         ;;
     esac
   done < "$conf"
 
-  [ -n "$arch_path" ] || arch_path=$(_opkg_arch_path_fallback)
-  if [ -z "$arch_path" ]; then
-    error "Не удалось определить arch-путь. Проверьте src/gz в $conf"
+  if ! _opkg_arch_path_ok "$arch_path"; then
+    arch_path=$(_opkg_arch_path_fallback)
+  fi
+  if ! _opkg_arch_path_ok "$arch_path"; then
+    error "Не удалось определить arch-путь (сейчас: «${arch_path:-пусто}»). Проверьте src/gz в $conf"
     return 1
   fi
   info "Arch-path: $arch_path"
