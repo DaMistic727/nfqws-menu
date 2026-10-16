@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.10.1"
+SCRIPT_VERSION="0.10.2"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5156,6 +5156,7 @@ remove_firc() {
   else
     warn "firc не установлен."
   fi
+  # /opt/etc/opkg/awg_manager.conf общий с awg-manager — не трогаем
 }
 
 

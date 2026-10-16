@@ -404,11 +404,14 @@ Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
 curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh | sh
 ```
 
-1. **Установка firc** — ipk с [GitHub Releases](https://github.com/hoaxisr/firc/releases) под архитектуру (aarch64 / mipsel / mips), зависимость `socat`
-2. **Удаление firc** — `opkg remove` + опционально конфиг `/opt/etc/firc`
+1. **Установка firc** — как на [repo.hoaxisr.ru](https://repo.hoaxisr.ru/):
+   `src/gz hoaxisr http://repo.hoaxisr.ru/{aarch64-k3.10|mipsel-k3.4|mips-k3.4}` → `/opt/etc/opkg/awg_manager.conf`, затем `opkg update && opkg install firc` (Depends тянет opkg)
+2. **Удаление firc** — `opkg remove` + опционально `/opt/etc/firc` (`awg_manager.conf` не трогаем — общий с awg-manager)
+3. **Диагностика** — если демон не стартует
 
 - Init: `/opt/etc/init.d/S99firc` (start | stop | restart | status)
 - WebUI: обычно порт **666**
+- Целевая платформа: **KeeneticOS 4+/5+** (ядро вроде `4.9-ndm-5`), aarch64 / mipsel / mips
 - Статус в блоке установленных компонентов; удаление — здесь или в п. 88
 
 ### 77. Change language
@@ -434,7 +437,7 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 - **awg-manager** — `opkg remove` + `rm -rf /opt/etc/awg-manager`
 - **tg-ws-proxy-rs** — бинарь, init, конфиги
 - **usque-keenetic** — `opkg remove --autoremove` + `/opt/etc/opkg/usque-keenetic.conf`
-- **firc** — `opkg remove --autoremove` (+ stop `S99firc`)
+- **firc** — `opkg remove --autoremove` (+ stop `S99firc`; `awg_manager.conf` не удаляем)
 - **magitrickle** — `opkg remove` + запрос на удаление `/opt/etc/opkg/magitrickle.conf`
 - **KeenKit** — удаление `/opt/keenkit.sh`
 - **a)** — все пакеты NFQWS + dpi-detector
@@ -448,13 +451,17 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 
 ## Changelog
 
+### 0.10.2
+
+- **п. 17 firc** — установка через [repo.hoaxisr.ru](https://repo.hoaxisr.ru/): `src/gz hoaxisr` → `/opt/etc/opkg/awg_manager.conf`, `opkg update && opkg install firc`; Depends тянет opkg; conf общий с awg-manager не удаляется при remove
+
 ### 0.10.1
 
 - Нумерация версии: переход на линейку **0.10.x** (MINOR после серии 0.9.x).
 
 ### 0.9.84
 
-- **п. 17** — **firc** ([hoaxisr/firc](https://github.com/hoaxisr/firc)): точечная маршрутизация по доменам (FakeIP); `installer_firc.sh` — установка ipk с Releases + удаление; статус в show_installed
+- **п. 17** — **firc** ([hoaxisr/firc](https://github.com/hoaxisr/firc), [repo.hoaxisr.ru](https://repo.hoaxisr.ru/)): opkg install из фида; статус в show_installed
 
 
 ### 0.9.x
