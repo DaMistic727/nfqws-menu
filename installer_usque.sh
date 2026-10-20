@@ -406,6 +406,65 @@ ensure_session() {
   return 1
 }
 
+# Скачать ipk в /tmp и поставить локально (не занимает /opt на время загрузки)
+# $1 = base URL репозитория без хвоша, напр. .../usque-keenetic/mipsel
+install_ipk_via_tmp() {
+  repo_url="$1"
+  pkg_idx="$TMPDIR/Packages"
+  mkdir -p "$TMPDIR"
+
+  info "Индекс: ${repo_url}/Packages"
+  if ! http_get "${repo_url}/Packages" "$pkg_idx"; then
+    # иногда только Packages.gz
+    if command -v gzip >/dev/null 2>&1 && http_get "${repo_url}/Packages.gz" "${pkg_idx}.gz"; then
+      gzip -dc "${pkg_idx}.gz" > "$pkg_idx" 2>/dev/null || return 1
+    else
+      return 1
+    fi
+  fi
+
+  # Filename: usque-keenetic_0.3.0_mipsel-3.4.ipk
+  fname=$(awk -v p="$PKG_NAME" '
+    $1=="Package:" && $2==p {inpkg=1; next}
+    inpkg && $1=="Filename:" {print $2; exit}
+    inpkg && $1=="Package:" {inpkg=0}
+  ' "$pkg_idx")
+  if [ -z "$fname" ]; then
+    error "В индексе нет Filename для $PKG_NAME"
+    return 1
+  fi
+  fsize=$(awk -v p="$PKG_NAME" '
+    $1=="Package:" && $2==p {inpkg=1; next}
+    inpkg && $1=="Size:" {print $2; exit}
+    inpkg && $1=="Package:" {inpkg=0}
+  ' "$pkg_idx")
+
+  ipk_url="${repo_url}/${fname}"
+  ipk_path="$TMPDIR/$fname"
+  info "Скачивание ipk в /tmp: $fname${fsize:+ ($fsize Б)}"
+  if ! http_get "$ipk_url" "$ipk_path"; then
+    error "Не удалось скачать $ipk_url"
+    return 1
+  fi
+  got=$(wc -c < "$ipk_path" 2>/dev/null | tr -d ' \t')
+  case "$got" in ''|*[!0-9]*) got=0 ;; esac
+  if [ "$got" -lt 100000 ]; then
+    error "ipk слишком маленький (${got} Б) — обрыв загрузки."
+    rm -f "$ipk_path"
+    return 1
+  fi
+  info "Скачано в $ipk_path ($got Б)"
+
+  # локальная установка — download cache на /opt не нужен
+  if ! opkg install "$ipk_path"; then
+    error "opkg install $ipk_path не удался."
+    rm -f "$ipk_path"
+    return 1
+  fi
+  rm -f "$ipk_path" "$pkg_idx" "${pkg_idx}.gz" 2>/dev/null || true
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # 1) Установка usque-keenetic (side-effect-tm)
 # ---------------------------------------------------------------------------
@@ -414,10 +473,11 @@ do_install() {
   info "Установка $PKG_NAME (side-effect-tm)"
   need_arch || return 1
   check_os_for_usque || return 1
-  check_opt_space 12288 || return 1
+  # ipk качается в /tmp; на /opt нужно место только под распаковку (~6–8 МБ)
+  check_opt_space 8192 || return 1
 
   if is_pkg_installed; then
-    info "Пакет уже установлен — обновление через opkg..."
+    info "Пакет уже установлен — обновление..."
   else
     info "Пакет не установлен — установка..."
   fi
@@ -425,12 +485,15 @@ do_install() {
   mkdir -p /opt/etc/opkg
   # Сначала per-arch (mipsel/aarch64/mips ~4–5 МБ), fallback на /all (~14 МБ)
   repo_arch="${REPO_BASE}/${ARCH}"
+  repo_use="$repo_arch"
   echo "src/gz ${PKG_NAME} ${repo_arch}" > "$OPKG_CONF"
   info "Репозиторий: ${repo_arch}"
   info "Записан: $OPKG_CONF"
 
+  # индекс нужен и для opkg status, и для имени файла
   if ! opkg update; then
     warn "opkg update с /${ARCH} не удался — пробуем /all"
+    repo_use="$REPO_URL_ALL"
     echo "src/gz ${PKG_NAME} ${REPO_URL_ALL}" > "$OPKG_CONF"
     info "Репозиторий: ${REPO_URL_ALL}"
     if ! opkg update; then
@@ -439,18 +502,47 @@ do_install() {
     fi
   fi
 
-  if is_pkg_installed; then
-    if opkg upgrade "$PKG_NAME"; then
-      info "Обновление завершено."
-    else
-      warn "opkg upgrade без изменений (возможно, уже актуальная версия)."
+  # при нехватке места на /opt — ipk через /tmp (иначе opkg качает в свой cache под /opt)
+  opt_free=$(df -k /opt 2>/dev/null | awk 'NR==2 {print $4}')
+  case "$opt_free" in ''|*[!0-9]*) opt_free=0 ;; esac
+  use_tmp=0
+  if [ "$opt_free" -lt 15360 ]; then
+    use_tmp=1
+    info "На /opt мало места (${opt_free} КБ) — качаем ipk в /tmp"
+  fi
+
+  if [ "$use_tmp" = "1" ]; then
+    if ! install_ipk_via_tmp "$repo_use"; then
+      # fallback: обычный opkg install
+      warn "Установка через /tmp не удалась — пробуем opkg install..."
+      if ! opkg install "$PKG_NAME"; then
+        error "opkg install $PKG_NAME не удался."
+        return 1
+      fi
     fi
+    info "Установка/обновление завершено."
   else
-    if ! opkg install "$PKG_NAME"; then
-      error "opkg install $PKG_NAME не удался."
-      return 1
+    if is_pkg_installed; then
+      if opkg upgrade "$PKG_NAME"; then
+        info "Обновление завершено."
+      else
+        # upgrade мог ничего не сделать — дожимаем свежим ipk из /tmp
+        if ! install_ipk_via_tmp "$repo_use"; then
+          warn "opkg upgrade без изменений (возможно, уже актуальная версия)."
+        else
+          info "Обновление через ipk (/tmp) завершено."
+        fi
+      fi
+    else
+      if ! opkg install "$PKG_NAME"; then
+        warn "opkg install не удался — пробуем скачать ipk в /tmp..."
+        if ! install_ipk_via_tmp "$repo_use"; then
+          error "Установка $PKG_NAME не удалась."
+          return 1
+        fi
+      fi
+      info "Установка завершена."
     fi
-    info "Установка завершена."
   fi
 
   echo
