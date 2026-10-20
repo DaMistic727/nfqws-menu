@@ -25,7 +25,7 @@ warn()  { printf '%s\n' "${YELLOW}[!]${NC} $*"; }
 error() { printf '%s\n' "${RED}[!]${NC} $*"; }
 
 PKG_NAME="usque-keenetic"
-# Универсальный репозиторий side-effect-tm (aarch64 / mipsel / mips)
+# per-arch ipk ~4–5 МБ; /all — meta-пакет ~14 МБ со всеми бинарниками
 REPO_URL_ALL="https://side-effect-tm.github.io/usque-keenetic/all"
 REPO_BASE="https://side-effect-tm.github.io/usque-keenetic"
 OPKG_CONF="/opt/etc/opkg/${PKG_NAME}.conf"
@@ -41,6 +41,8 @@ TMPDIR="/tmp/usque-installer-$$"
 ARCH=""
 ARCH_RAW=""
 ARCH_SOURCE=""
+OS_TITLE=""      # title из RCI, напр. 4.3.6.2 / 5.1.5
+OS_MAJOR=""      # major: 4, 5, ...
 
 _arch_normalize() {
   case "$1" in
@@ -173,6 +175,62 @@ need_arch() {
   return 0
 }
 
+# KeeneticOS: RCI show/version → title (4.3.6.2 / 5.1.5)
+# usque-keenetic (OpkgTun / NDM) требует OS >= 5.0
+detect_os() {
+  OS_TITLE=""
+  OS_MAJOR=""
+  json=""
+  if command -v curl >/dev/null 2>&1; then
+    json=$(curl -s --connect-timeout 2 --max-time 3 "http://127.0.0.1:79/rci/show/version" 2>/dev/null) || json=""
+  fi
+  if [ -z "$json" ] && command -v wget >/dev/null 2>&1; then
+    json=$(wget -qO- -T 3 "http://127.0.0.1:79/rci/show/version" 2>/dev/null) || json=""
+  fi
+  if [ -z "$json" ]; then
+    return 0
+  fi
+  OS_TITLE=$(printf '%s' "$json" | sed -n 's/.*"title"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  # title вида 4.3.6.2 / 5.1.5 / 5.0
+  OS_MAJOR=$(printf '%s' "$OS_TITLE" | sed -n 's/^\([0-9][0-9]*\).*/\1/p')
+}
+
+# 0 = OK (>=5 или неизвестно), 1 = отказ пользователя, 2 = <5 но продолжили
+check_os_for_usque() {
+  detect_os
+  if [ -z "$OS_TITLE" ]; then
+    warn "Версия KeeneticOS не определена (RCI недоступен)."
+    warn "usque-keenetic рассчитан на OS >= 5.0 (интерфейсы OpkgTun)."
+    if ! confirm_yes "Продолжить установку?"; then
+      info "Отменено."
+      return 1
+    fi
+    return 0
+  fi
+  info "KeeneticOS: $OS_TITLE"
+  case "$OS_MAJOR" in
+    ''|*[!0-9]*)
+      warn "Не удалось разобрать major из title «$OS_TITLE»."
+      ;;
+    *)
+      if [ "$OS_MAJOR" -lt 5 ]; then
+        echo
+        warn "KeeneticOS $OS_TITLE — ниже 5.0."
+        warn "Интерфейсы OpkgTun появились только в OS 5.0."
+        warn "На 4.x: Cannot create NDM interface OpkgTun* — usque в веб-морде не появится."
+        warn "Рекомендуется обновить прошивку до 5.x (если доступна для вашей модели)."
+        echo
+        if ! confirm_yes "Всё равно установить пакет?"; then
+          info "Отменено."
+          return 1
+        fi
+        warn "Продолжаем на свой риск..."
+      fi
+      ;;
+  esac
+  return 0
+}
+
 is_pkg_installed() {
   if opkg list-installed 2>/dev/null | grep -q "^${PKG_NAME} "; then
     return 0
@@ -236,6 +294,7 @@ do_install() {
   echo
   info "Установка $PKG_NAME (side-effect-tm)"
   need_arch || return 1
+  check_os_for_usque || return 1
 
   if is_pkg_installed; then
     info "Пакет уже установлен — обновление через opkg..."
@@ -244,14 +303,16 @@ do_install() {
   fi
 
   mkdir -p /opt/etc/opkg
-  # Универсальный репозиторий (рекомендован upstream); fallback на per-arch
-  echo "src/gz ${PKG_NAME} ${REPO_URL_ALL}" > "$OPKG_CONF"
-  info "Репозиторий: ${REPO_URL_ALL}"
+  # Сначала per-arch (mipsel/aarch64/mips ~4–5 МБ), fallback на /all (~14 МБ)
+  repo_arch="${REPO_BASE}/${ARCH}"
+  echo "src/gz ${PKG_NAME} ${repo_arch}" > "$OPKG_CONF"
+  info "Репозиторий: ${repo_arch}"
   info "Записан: $OPKG_CONF"
 
   if ! opkg update; then
-    warn "opkg update с /all не удался — пробуем per-arch: ${REPO_BASE}/${ARCH}"
-    echo "src/gz ${PKG_NAME} ${REPO_BASE}/${ARCH}" > "$OPKG_CONF"
+    warn "opkg update с /${ARCH} не удался — пробуем /all"
+    echo "src/gz ${PKG_NAME} ${REPO_URL_ALL}" > "$OPKG_CONF"
+    info "Репозиторий: ${REPO_URL_ALL}"
     if ! opkg update; then
       error "opkg update не удался. Проверьте сеть / DNS / DPI."
       return 1
