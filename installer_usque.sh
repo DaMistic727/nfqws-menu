@@ -4,7 +4,8 @@
 #
 # 1) Установка usque-keenetic (side-effect-tm opkg)
 # 2) Обновление bin usque (Diniboy1123/usque releases)
-# 3) Удаление usque-keenetic
+# 3) Проверка интерфейса (сервис + google/telegram через IFACE)
+# 88) Удаление usque-keenetic
 #
 # Запуск:
 #   sh installer_usque.sh
@@ -818,7 +819,126 @@ do_update_bin() {
 }
 
 # ---------------------------------------------------------------------------
-# 3) Удаление
+# 3) Проверка интерфейса
+# ---------------------------------------------------------------------------
+get_usque_iface() {
+  iface=""
+  if [ -f "$CONF_FILE" ]; then
+    iface=$(sed -n 's/^IFACE="\(.*\)"/\1/p' "$CONF_FILE" | head -1)
+    [ -z "$iface" ] && iface=$(sed -n "s/^IFACE='\(.*\)'/\1/p" "$CONF_FILE" | head -1)
+    [ -z "$iface" ] && iface=$(sed -n 's/^IFACE=\([^#[:space:]]*\).*/\1/p' "$CONF_FILE" | head -1)
+  fi
+  [ -z "$iface" ] && iface="opkgtun0"
+  printf '%s' "$iface"
+}
+
+is_usque_running() {
+  if [ -x "$INIT_SCRIPT" ]; then
+    if "$INIT_SCRIPT" status 2>/dev/null | grep -qiE 'running|запущен|pid'; then
+      return 0
+    fi
+  fi
+  # pidfile пакета
+  if [ -f /opt/var/run/usque.pid ]; then
+    pid=$(cat /opt/var/run/usque.pid 2>/dev/null | tr -d ' \t\r\n')
+    case "$pid" in
+      ''|*[!0-9]*) ;;
+      *) kill -0 "$pid" 2>/dev/null && return 0 ;;
+    esac
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f '/opt/usr/bin/usque' >/dev/null 2>&1 && return 0
+  fi
+  # fallback
+  if ps 2>/dev/null | grep -v grep | grep -q '[u]sque'; then
+    return 0
+  fi
+  return 1
+}
+
+# HTTP-проверка через интерфейс usque
+check_url_via_iface() {
+  # check_url_via_iface IFACE URL LABEL
+  ifc="$1"
+  url="$2"
+  label="$3"
+  code=""
+  err=""
+  if command -v curl >/dev/null 2>&1; then
+    # -k на случай MITM; --interface привязка к tun
+    out=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 15       --interface "$ifc" -L "$url" 2>&1) || true
+    code=$(printf '%s' "$out" | tr -d '\r' | grep -oE '[0-9]{3}$' | tail -1)
+    if [ -z "$code" ]; then
+      err=$(printf '%s' "$out" | tr '\n' ' ' | head -c 120)
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    # wget без --bind-interface на busybox — только общий путь
+    warn "wget без --interface: проверка $label без привязки к $ifc"
+    if wget -q -O /dev/null -T 15 "$url" 2>/dev/null; then
+      code="200"
+    else
+      err="wget failed"
+    fi
+  else
+    error "Нужен curl для проверки через интерфейс."
+    return 1
+  fi
+
+  case "$code" in
+    2??|3??)
+      info "$label: OK (HTTP $code) via $ifc"
+      return 0
+      ;;
+    *)
+      if [ -n "$code" ]; then
+        warn "$label: HTTP $code via $ifc"
+      else
+        warn "$label: FAIL via $ifc${err:+ — $err}"
+      fi
+      return 1
+      ;;
+  esac
+}
+
+do_check_iface() {
+  echo
+  info "Проверка интерфейса usque"
+  iface=$(get_usque_iface)
+  info "IFACE: $iface (из $CONF_FILE)"
+
+  if ! is_usque_running; then
+    error "Сервис usque не запущен."
+    echo "  Запуск: $INIT_SCRIPT start"
+    return 1
+  fi
+  info "Сервис: запущен"
+
+  # интерфейс в системе
+  if ip link show "$iface" >/dev/null 2>&1 || ifconfig "$iface" >/dev/null 2>&1; then
+    info "Интерфейс $iface: есть в системе"
+  else
+    warn "Интерфейс $iface не найден (ip link / ifconfig)."
+  fi
+
+  echo
+  ok=0
+  check_url_via_iface "$iface" "https://www.google.com/" "google.com" && ok=$((ok + 1))
+  check_url_via_iface "$iface" "https://web.telegram.org/" "web.telegram.org" && ok=$((ok + 1))
+  echo
+  if [ "$ok" -eq 2 ]; then
+    info "Проверка пройдена: оба хоста доступны через $iface"
+    return 0
+  elif [ "$ok" -eq 1 ]; then
+    warn "Частично: доступен 1 из 2 хостов через $iface"
+    return 1
+  else
+    error "Оба хоста недоступны через $iface"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 88) Удаление
 # ---------------------------------------------------------------------------
 do_remove() {
   echo
@@ -974,7 +1094,8 @@ main_menu() {
     echo
     printf '  1) Установка (usque-keenetic)%s\n' "$(fmt_pkg_latest)"
     printf '  2) Обновление bin (usque)%s\n' "$(fmt_bin_latest)"
-    echo "  3) Удаление usque-keenetic"
+    echo "  3) Проверка интерфейса"
+    echo " 88) Удаление usque-keenetic"
     echo "  0) Выход"
     echo
     printf '%s' "${BOLD}Выбор: ${NC}"
@@ -983,7 +1104,8 @@ main_menu() {
     case "$choice" in
       1) do_install; pause ;;
       2) do_update_bin; pause ;;
-      3) do_remove; pause ;;
+      3) do_check_iface; pause ;;
+      88) do_remove; pause ;;
       0|"") info "Выход."; exit 0 ;;
       *) warn "Неверный пункт"; pause ;;
     esac
