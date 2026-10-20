@@ -318,11 +318,12 @@ read_choice() {
 }
 
 confirm_yes() {
-  printf '%s' "${YELLOW}[?]${NC} $1 [y/N]: "
+  # по умолчанию Да (Enter / Y)
+  printf '%s' "${YELLOW}[?]${NC} $1 [Y/n]: "
   c=$(read_choice)
   case "$c" in
-    y|Y|yes|YES|д|Д|да|Да) return 0 ;;
-    *) return 1 ;;
+    n|N|no|NO|н|Н|нет|Нет) return 1 ;;
+    *) return 0 ;;
   esac
 }
 
@@ -373,19 +374,22 @@ ensure_session() {
     return 1
   fi
 
-  info "Пробуем register..."
-  # register из каталога конфига, чтобы session.conf лег куда нужно
+  info "Пробуем register (--accept-tos --config $SESSION_FILE)..."
   mkdir -p /opt/etc/usque
-  (
-    cd /opt/etc/usque 2>/dev/null || true
-    # разные версии usque: register как подкоманда
-    if "$USQUE_BIN" register 2>&1; then
-      :
-    else
-      # postinst пакета дергает register через init — fallback
-      [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" start 2>&1 || true
-    fi
-  )
+  # как в side-effect-tm scripts/usque: register --accept-tos --config session.conf
+  # иначе usque пишет config.json в CWD и сервис не видит сессию
+  if ! "$USQUE_BIN" register --accept-tos --config "$SESSION_FILE" 2>&1; then
+    warn "register вернул ошибку — пробуем через init..."
+    [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" start 2>&1 || true
+  fi
+
+  # на всякий случай: если создался только config.json рядом
+  if [ ! -f "$SESSION_FILE" ] && [ -f /opt/etc/usque/config.json ]; then
+    mv -f /opt/etc/usque/config.json "$SESSION_FILE" 2>/dev/null && info "config.json → session.conf"
+  fi
+  if [ ! -f "$SESSION_FILE" ] && [ -f ./config.json ]; then
+    mv -f ./config.json "$SESSION_FILE" 2>/dev/null && info "config.json → session.conf"
+  fi
 
   if [ -f "$SESSION_FILE" ] && [ -s "$SESSION_FILE" ]; then
     info "Регистрация OK: $SESSION_FILE"
