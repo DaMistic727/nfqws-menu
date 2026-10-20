@@ -282,29 +282,106 @@ is_pkg_installed() {
   return 1
 }
 
-http_get() {
-  # http_get URL DEST
+# Зеркала GitHub (как в nfqws-menu): оригинал → ghproxy / jsdelivr
+github_alt_urls() {
   url="$1"
-  dest="$2"
+  case "$url" in
+    https://github.com/*/releases/download/*)
+      printf '%s\n' "$url"
+      printf '%s\n' "https://ghproxy.net/${url}"
+      printf '%s\n' "https://mirror.ghproxy.com/${url}"
+      printf '%s\n' "https://gh.ddlc.top/${url}"
+      printf '%s\n' "https://gitproxy.click/${url}"
+      ;;
+    https://api.github.com/*)
+      printf '%s\n' "$url"
+      printf '%s\n' "https://ghproxy.net/${url}"
+      printf '%s\n' "https://mirror.ghproxy.com/${url}"
+      ;;
+    https://raw.githubusercontent.com/*)
+      rest="${url#https://raw.githubusercontent.com/}"
+      owner="${rest%%/*}"; rest="${rest#*/}"
+      repo="${rest%%/*}"; rest="${rest#*/}"
+      ref="${rest%%/*}"; path_rest="${rest#*/}"
+      printf '%s\n' "$url"
+      if [ -n "$owner" ] && [ -n "$repo" ] && [ -n "$ref" ]; then
+        printf '%s\n' "https://fastly.jsdelivr.net/gh/${owner}/${repo}@${ref}/${path_rest}"
+        printf '%s\n' "https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/${path_rest}"
+      fi
+      printf '%s\n' "https://ghproxy.net/${url}"
+      ;;
+    *)
+      printf '%s\n' "$url"
+      ;;
+  esac
+}
+
+_http_get_one() {
+  # _http_get_one URL DEST (stderr глушим — иначе curl: (35) путает вывод)
+  u="$1"
+  d="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$dest"
+    curl -fsSL --connect-timeout 10 --max-time 180 "$u" -o "$d" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$dest" -T 120 "$url"
+    wget -q -O "$d" -T 180 "$u" 2>/dev/null
   else
-    error "Нужны curl или wget."
     return 1
   fi
 }
 
-http_get_stdout() {
+http_get() {
+  # http_get URL DEST — с перебором зеркал
   url="$1"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 --max-time 30 "$url"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -O- -T 30 "$url"
-  else
+  dest="$2"
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    error "Нужны curl или wget."
     return 1
   fi
+  rm -f "$dest"
+  github_alt_urls "$url" | while IFS= read -r alt || [ -n "$alt" ]; do
+    [ -n "$alt" ] || continue
+    info "Пробуем: $alt"
+    if _http_get_one "$alt" "$dest" && [ -s "$dest" ]; then
+      [ "$alt" != "$url" ] && info "Скачано через зеркало"
+      # while в пайпе — нельзя return наружу; маркер успеха
+      echo OK > "${dest}.ok"
+      break
+    fi
+    rm -f "$dest"
+  done
+  if [ -f "${dest}.ok" ] && [ -s "$dest" ]; then
+    rm -f "${dest}.ok"
+    return 0
+  fi
+  rm -f "${dest}.ok" "$dest"
+  return 1
+}
+
+http_get_stdout() {
+  url="$1"
+  tmp_body="/tmp/usque-http-body-$$"
+  rm -f "$tmp_body"
+  github_alt_urls "$url" | while IFS= read -r alt || [ -n "$alt" ]; do
+    [ -n "$alt" ] || continue
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL --connect-timeout 10 --max-time 30 "$alt" -o "$tmp_body" 2>/dev/null || continue
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q -O "$tmp_body" -T 30 "$alt" 2>/dev/null || continue
+    else
+      return 1
+    fi
+    if [ -s "$tmp_body" ]; then
+      break
+    fi
+    rm -f "$tmp_body"
+  done
+  if [ -s "$tmp_body" ]; then
+    cat "$tmp_body"
+    rm -f "$tmp_body"
+    return 0
+  fi
+  rm -f "$tmp_body"
+  return 1
 }
 
 read_choice() {
