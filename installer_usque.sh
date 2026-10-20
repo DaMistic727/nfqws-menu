@@ -32,6 +32,10 @@ OPKG_CONF="/opt/etc/opkg/${PKG_NAME}.conf"
 INIT_SCRIPT="/opt/etc/init.d/S51usque"
 CONF_FILE="/opt/etc/usque/usque.conf"
 USQUE_BIN="/opt/usr/bin/usque"
+SESSION_FILE="/opt/etc/usque/session.conf"
+CF_API_HOST="api.cloudflareclient.com"
+# CDN IP, на котором обычно проходит TLS (8.6/8.47 часто RST при DPI)
+CF_API_IP="104.16.24.84"
 DINIBOY_REPO="Diniboy1123/usque"
 TMPDIR="/tmp/usque-installer-$$"
 
@@ -231,6 +235,46 @@ check_os_for_usque() {
   return 0
 }
 
+# Свободное место на /opt (КБ). ipk per-arch ~4.5–5 МБ + tmp opkg → желательно ≥12 МБ
+check_opt_space() {
+  min_kb="${1:-12288}"
+  avail=""
+  # df -k: колонка Available (часто 4-я)
+  avail=$(df -k /opt 2>/dev/null | awk 'NR==2 {print $4}')
+  case "$avail" in
+    ''|*[!0-9]*) 
+      avail=$(df -k /opt 2>/dev/null | awk 'NR==2 {print $(NF-2)}')
+      ;;
+  esac
+  case "$avail" in
+    ''|*[!0-9]*)
+      warn "Не удалось определить свободное место на /opt."
+      return 0
+      ;;
+  esac
+  # человекочитаемо
+  if [ "$avail" -ge 1024 ]; then
+    human="$((avail / 1024))M"
+  else
+    human="${avail}K"
+  fi
+  info "Свободно на /opt: $human"
+  if [ "$avail" -lt "$min_kb" ]; then
+    echo
+    error "Мало места на /opt (нужно ≥$((min_kb / 1024)) МБ, есть $human)."
+    error "ipk usque-keenetic ~5 МБ + временные файлы opkg."
+    error "Освободите место, иначе бинарник будет битым (segfault при register)."
+    echo
+    printf '%s\n' "${DIM}Подсказка: df -h /opt ; du -sh /opt/* 2>/dev/null | sort -hr | head${NC}"
+    if ! confirm_yes "Всё равно продолжить?"; then
+      info "Отменено."
+      return 1
+    fi
+    warn "Продолжаем на свой риск..."
+  fi
+  return 0
+}
+
 is_pkg_installed() {
   if opkg list-installed 2>/dev/null | grep -q "^${PKG_NAME} "; then
     return 0
@@ -287,6 +331,81 @@ pause() {
   read_choice >/dev/null
 }
 
+# ndmc: системные libs первыми (как в nfqws-menu) — иначе OpenSSL из Entware ломает ndmc
+ndmc_cli() {
+  LD_LIBRARY_PATH=/lib:/usr/lib command ndmc -c "$@"
+}
+
+# Статический DNS для CF Client API (обход «кривых» A-записей / DPI на 8.x)
+ensure_cf_api_dns() {
+  info "DNS для ${CF_API_HOST} → ${CF_API_IP} (ndmc ip host)"
+  if ! command -v ndmc >/dev/null 2>&1; then
+    warn "ndmc не найден — добавьте вручную: ndmc -c \"ip host ${CF_API_HOST} ${CF_API_IP}\""
+    return 1
+  fi
+  if ndmc_cli "ip host ${CF_API_HOST} ${CF_API_IP}" >/dev/null 2>&1; then
+    ndmc_cli "system configuration save" >/dev/null 2>&1 || true
+    info "Запись ip host сохранена."
+    return 0
+  fi
+  warn "ndmc не принял ip host — попробуйте вручную из CLI Keenetic."
+  return 1
+}
+
+# Регистрация Cloudflare, если нет session.conf
+ensure_session() {
+  if [ -f "$SESSION_FILE" ] && [ -s "$SESSION_FILE" ]; then
+    info "Сессия уже есть: $SESSION_FILE"
+    return 0
+  fi
+
+  echo
+  warn "Нет $SESSION_FILE — нужна регистрация в Cloudflare."
+  warn "Частая причина сбоя: TLS RST на ${CF_API_HOST} (DPI / «левые» A-записи 8.x)."
+  echo
+
+  if confirm_yes "Добавить статический DNS ${CF_API_HOST} → ${CF_API_IP}?"; then
+    ensure_cf_api_dns || true
+  fi
+
+  if [ ! -x "$USQUE_BIN" ]; then
+    error "Нет $USQUE_BIN — регистрация невозможна."
+    return 1
+  fi
+
+  info "Пробуем register..."
+  # register из каталога конфига, чтобы session.conf лег куда нужно
+  mkdir -p /opt/etc/usque
+  (
+    cd /opt/etc/usque 2>/dev/null || true
+    # разные версии usque: register как подкоманда
+    if "$USQUE_BIN" register 2>&1; then
+      :
+    else
+      # postinst пакета дергает register через init — fallback
+      [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" start 2>&1 || true
+    fi
+  )
+
+  if [ -f "$SESSION_FILE" ] && [ -s "$SESSION_FILE" ]; then
+    info "Регистрация OK: $SESSION_FILE"
+    if [ -x "$INIT_SCRIPT" ]; then
+      "$INIT_SCRIPT" start 2>/dev/null || "$INIT_SCRIPT" restart 2>/dev/null || true
+    fi
+    return 0
+  fi
+
+  echo
+  error "Регистрация не удалась (session.conf нет)."
+  printf '%s\n' "${DIM}Проверьте:${NC}"
+  echo "  curl -v --connect-timeout 10 -o /dev/null https://${CF_API_HOST}/"
+  echo "  ndmc -c \"ip host ${CF_API_HOST} ${CF_API_IP}\""
+  echo "  ndmc -c \"system configuration save\""
+  echo "  /opt/usr/bin/usque register"
+  echo "  $INIT_SCRIPT start"
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # 1) Установка usque-keenetic (side-effect-tm)
 # ---------------------------------------------------------------------------
@@ -295,6 +414,7 @@ do_install() {
   info "Установка $PKG_NAME (side-effect-tm)"
   need_arch || return 1
   check_os_for_usque || return 1
+  check_opt_space 12288 || return 1
 
   if is_pkg_installed; then
     info "Пакет уже установлен — обновление через opkg..."
@@ -340,10 +460,25 @@ do_install() {
   printf '%s\n' "${BOLD}Конфигурация${NC}"
   echo "  $CONF_FILE"
   echo "  IFACE=\"opkgtun0\"   # вид opkgtun*"
-  if [ -x "$USQUE_BIN" ]; then
-    info "Бинарник: $USQUE_BIN"
-    "$USQUE_BIN" version 2>/dev/null || "$USQUE_BIN" --version 2>/dev/null || true
+  if [ -f "$USQUE_BIN" ]; then
+    bsz=$(wc -c < "$USQUE_BIN" 2>/dev/null | tr -d ' \t')
+    case "$bsz" in ''|*[!0-9]*) bsz=0 ;; esac
+    if [ "$bsz" -lt 1000000 ]; then
+      error "Бинарник $USQUE_BIN слишком маленький (${bsz} Б) — установка, скорее всего, оборвалась (нет места)."
+      error "Освободите /opt и переустановите (п.3 → п.1) или: opkg remove usque-keenetic && opkg install usque-keenetic"
+      return 1
+    fi
+    info "Бинарник: $USQUE_BIN (${bsz} Б)"
+    if [ -x "$USQUE_BIN" ]; then
+      "$USQUE_BIN" version 2>/dev/null || "$USQUE_BIN" --version 2>/dev/null || true
+    fi
+  else
+    error "Бинарник $USQUE_BIN не найден после установки."
+    return 1
   fi
+
+  # postinst пакета часто не может register из-за DPI — дожимаем здесь
+  ensure_session || true
   return 0
 }
 
@@ -479,8 +614,15 @@ do_update_bin() {
 
   mkdir -p "$(dirname "$USQUE_BIN")"
   if [ -f "$USQUE_BIN" ]; then
-    cp -a "$USQUE_BIN" "${USQUE_BIN}.bak" 2>/dev/null || true
-    info "Бэкап: ${USQUE_BIN}.bak"
+    if confirm_yes "Сделать бэкап текущего bin (${USQUE_BIN}.bak)?"; then
+      if cp -a "$USQUE_BIN" "${USQUE_BIN}.bak" 2>/dev/null; then
+        info "Бэкап: ${USQUE_BIN}.bak"
+      else
+        warn "Не удалось создать бэкап (мало места?)."
+      fi
+    else
+      info "Бэкап пропущен."
+    fi
   fi
   cp -f "$newbin" "$USQUE_BIN"
   chmod +x "$USQUE_BIN"
@@ -490,7 +632,9 @@ do_update_bin() {
     "$USQUE_BIN" version 2>/dev/null || "$USQUE_BIN" --version 2>/dev/null || true
   fi
 
-  if [ -x "$INIT_SCRIPT" ]; then
+  if [ ! -f "$SESSION_FILE" ] || [ ! -s "$SESSION_FILE" ]; then
+    ensure_session || true
+  elif [ -x "$INIT_SCRIPT" ]; then
     info "Запуск сервиса..."
     "$INIT_SCRIPT" start 2>/dev/null || warn "Не удалось запустить $INIT_SCRIPT"
   fi
