@@ -6382,6 +6382,53 @@ upd_cache_fresh() {
 upd_cleanup() {
   [ -n "${UPD_JOB:-}" ] && kill "$UPD_JOB" 2>/dev/null
   rm -f "${UPD_CACHE}.tmp.$$" 2>/dev/null
+  rm -f "${MENU_PIDFILE:-/tmp/nfqws-menu.pid}" 2>/dev/null
+  return 0
+}
+
+# PID-файл + завершение чужих/осиротевших экземпляров меню.
+# После обрыва SSH старый процесс часто крутит read -t вхолостую (100% CPU).
+MENU_PIDFILE="/tmp/nfqws-menu.pid"
+
+_menu_is_menu_pid() {
+  local p="$1" c
+  [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] || return 1
+  c=$(tr -d '\0' < "/proc/$p/cmdline" 2>/dev/null)
+  case "$c" in
+    *nfqws-menu.sh*|*'/opt/bin/menu'*|*/opt/nfqws-menu.sh*) return 0 ;;
+  esac
+  return 1
+}
+
+_menu_kill_pid() {
+  local p="$1"
+  [ -n "$p" ] && [ "$p" != "$$" ] || return 0
+  kill -TERM "$p" 2>/dev/null || true
+  sleep 1
+  kill -KILL "$p" 2>/dev/null || true
+}
+
+# Убить другие копии меню (в т.ч. после обрыва сессии).
+ensure_single_instance() {
+  local old p
+  old=$(cat "$MENU_PIDFILE" 2>/dev/null | tr -d ' \t\r\n')
+  if [ -n "$old" ] && [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null; then
+    if _menu_is_menu_pid "$old"; then
+      warn "Предыдущее меню (PID $old) — завершаем..."
+      _menu_kill_pid "$old"
+    fi
+  fi
+  # Доп. проход: любые nfqws-menu /opt/bin/menu кроме нас
+  for p in /proc/[0-9]*; do
+    [ -r "$p/cmdline" ] || continue
+    p=${p#/proc/}
+    [ "$p" = "$$" ] && continue
+    _menu_is_menu_pid "$p" || continue
+    warn "Лишний процесс меню (PID $p) — завершаем..."
+    _menu_kill_pid "$p"
+  done
+  mkdir -p "$(dirname "$MENU_PIDFILE")" 2>/dev/null || true
+  printf '%s\n' "$$" > "$MENU_PIDFILE"
   return 0
 }
 
@@ -6391,6 +6438,9 @@ upd_start() {
   MENU_PID=$$
   trap 'UPD_REDRAW=1' USR1
   trap 'upd_cleanup' EXIT
+  # обрыв SSH / kill — сразу выходим, не оставляем зомби с 100% CPU
+  trap 'upd_cleanup; exit 129' HUP
+  trap 'upd_cleanup; exit 143' TERM
   # NFQWS_MENU_UPDATE_BG=0 — без фоновой проверки (без второго кадра)
   case "${NFQWS_MENU_UPDATE_BG:-1}" in
     0|false|FALSE|no|NO) return 0 ;;
@@ -6480,6 +6530,8 @@ upd_legend() {
 # 1 — перерисовать (пришла проверка), 2 — stdin закрыт (меню завершается).
 # На BusyBox/ash USR1 часто НЕ прерывает блокирующий read — поэтому на TTY
 # крутим read -t 1 и сами смотрим UPD_REDRAW (перерисовка без Enter).
+# Важно: после обрыва SSH [ -t 0 ] становится ложью или read падает сразу —
+# без проверки это busy-loop на 100% CPU.
 read_choice() {
   local _var="$1"
   READ_RC=0
@@ -6490,9 +6542,18 @@ read_choice() {
         READ_RC=1
         return 1
       fi
+      # сессия умерла (SSH drop) — не крутить CPU
+      if [ ! -t 0 ]; then
+        READ_RC=2
+        return 1
+      fi
       # timeout 1 с: 0 = строка введена; иначе таймаут/сигнал → снова цикл
       if read -r -t 1 "$_var" 2>/dev/null; then
         return 0
+      fi
+      if [ ! -t 0 ]; then
+        READ_RC=2
+        return 1
       fi
       if [ "$UPD_REDRAW" = 1 ]; then
         UPD_REDRAW=0
@@ -6518,6 +6579,7 @@ read_choice() {
 # Главное меню
 # ---------------------------------------------------------------------------
 main_menu() {
+  ensure_single_instance
   upd_start
   while true; do
     clear 2>/dev/null || true
