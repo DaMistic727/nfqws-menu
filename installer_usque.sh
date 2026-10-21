@@ -1209,47 +1209,76 @@ show_status() {
   fi
 }
 
-# Метка крайних версий для пунктов меню (синий + жирный)
+# Метка версий (синий + жирный), без ведущего пробела — отступ даёт menu_item
 fmt_pkg_latest() {
   if [ -n "$LATEST_PKG" ] && [ -n "$LATEST_PKG_USQUE" ]; then
-    printf ' %s%s[ %s / %s ]%s' "$BLUE" "$BOLD" "$LATEST_PKG" "$LATEST_PKG_USQUE" "$NC"
+    printf '%s%s[%s / %s]%s' "$BLUE" "$BOLD" "$LATEST_PKG" "$LATEST_PKG_USQUE" "$NC"
   elif [ -n "$LATEST_PKG" ]; then
-    printf ' %s%s[ %s ]%s' "$BLUE" "$BOLD" "$LATEST_PKG" "$NC"
+    printf '%s%s[%s]%s' "$BLUE" "$BOLD" "$LATEST_PKG" "$NC"
   fi
 }
 
 fmt_bin_latest() {
   if [ -n "$LATEST_BIN" ]; then
-    printf ' %s%s[%s]%s' "$BLUE" "$BOLD" "$LATEST_BIN" "$NC"
+    printf '%s%s[%s]%s' "$BLUE" "$BOLD" "$LATEST_BIN" "$NC"
   fi
+}
+
+# Ровная строка меню: "  1)  label................  tag"
+# label_pad — целевая ширина подписи в байтах (кириллица ≈ 2 байта/символ в UTF-8)
+menu_item() {
+  # menu_item NUM LABEL [TAG]
+  num="$1"
+  label="$2"
+  tag="${3:-}"
+  # номер: 2 символа, выравнивание вправо
+  printf ' %s%2s%s)  ' "$BOLD" "$num" "$NC"
+  printf '%s' "$label"
+  if [ -n "$tag" ]; then
+    # добиваем пробелами до ~34 байт подписи, чтобы теги шли одной колонкой
+    # (на UTF-8 это приблизительно; для кириллицы берём запас)
+    pad=34
+    # длина в байтах
+    llen=$(printf '%s' "$label" | wc -c | tr -d ' ')
+    case "$llen" in ''|*[!0-9]*) llen=0 ;; esac
+    n=$((pad - llen))
+    if [ "$n" -gt 0 ]; then
+      while [ "$n" -gt 0 ]; do
+        printf ' '
+        n=$((n - 1))
+      done
+    else
+      printf '  '
+    fi
+    printf '%s' "$tag"
+  fi
+  printf '\n'
 }
 
 main_menu() {
   while true; do
     clear 2>/dev/null || true
-    printf '%s\n' "${CYAN}================================================${NC}"
-    printf '%s\n' "${CYAN}${BOLD}           usque-keenetic${NC}"
-    printf '%s\n' "${CYAN}================================================${NC}"
+    printf '%s\n' "${CYAN}╔════════════════════════════════════════════╗${NC}"
+    printf '%s\n' "${CYAN}║${NC}${BOLD}            usque-keenetic             ${NC}${CYAN}║${NC}"
+    printf '%s\n' "${CYAN}╚════════════════════════════════════════════╝${NC}"
     echo
-    printf '%s\n' "${DIM}Usque — неофициальный клиент Cloudflare WARP с MASQUE:${NC}"
-    printf '%s\n' "${DIM}туннель через протокол Cloudflare, интерфейс opkgtun*${NC}"
-    printf '%s\n' "${DIM}и маршрутизация по DNS/IP в веб-интерфейсе Keenetic.${NC}"
-    echo
-    printf '%s\n' "${DIM}пакет: side-effect-tm/usque-keenetic (opkg)${NC}"
-    printf '%s\n' "${DIM}bin:   Diniboy1123/usque (GitHub releases)${NC}"
-    printf '%s\n' "${DIM}(Entware / Keenetic; aarch64, mipsel, mips)${NC}"
+    printf '%s\n' "${DIM}  Usque — Cloudflare WARP (MASQUE) для Keenetic${NC}"
+    printf '%s\n' "${DIM}  интерфейс opkgtun* · маршруты DNS/IP в веб-морде${NC}"
+    printf '%s\n' "${DIM}  pkg: side-effect-tm  ·  bin: Diniboy1123${NC}"
     echo
     show_status
-    # крайние версии (тихо, один раз за сессию; при ошибке сети — без меток)
     fetch_latest_versions 2>/dev/null || true
     echo
-    printf '  1) Установка (usque-keenetic)%s\n' "$(fmt_pkg_latest)"
-    printf '  2) Обновление bin (usque)%s\n' "$(fmt_bin_latest)"
-    echo "  3) Проверка интерфейса"
-    echo " 88) Удаление usque-keenetic"
-    echo "  0) Выход"
+    printf '%s\n' "${DIM}  ──────────────────────────────────────────${NC}"
+    menu_item "1"  "Установка (usque-keenetic)" "$(fmt_pkg_latest)"
+    menu_item "2"  "Обновление bin (usque)"     "$(fmt_bin_latest)"
+    menu_item "3"  "Проверка интерфейса"
+    printf '%s\n' "${DIM}  ──────────────────────────────────────────${NC}"
+    menu_item "88" "Удаление usque-keenetic"
+    menu_item "0"  "Выход"
+    printf '%s\n' "${DIM}  ──────────────────────────────────────────${NC}"
     echo
-    printf '%s' "${BOLD}Выбор: ${NC}"
+    printf '  %sВыбор:%s ' "$BOLD" "$NC"
     choice=$(read_choice)
     echo
     case "$choice" in
