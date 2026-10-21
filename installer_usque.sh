@@ -1231,8 +1231,8 @@ menu_item() {
   num="$1"
   label="$2"
   tag="${3:-}"
-  # номер: 2 символа, выравнивание вправо
-  printf ' %s%2s%s)  ' "$BOLD" "$num" "$NC"
+  # номер: ширина 3, вправо — "  1)" и " 88)" с общим краем ")"
+  printf '%s%3s)%s  ' "$BOLD" "$num" "$NC"
   printf '%s' "$label"
   if [ -n "$tag" ]; then
     # добиваем пробелами до ~34 байт подписи, чтобы теги шли одной колонкой
@@ -1258,9 +1258,9 @@ menu_item() {
 main_menu() {
   while true; do
     clear 2>/dev/null || true
-    printf '%s\n' "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    printf '%s\n' "${CYAN}║${NC}${BOLD}            usque-keenetic             ${NC}${CYAN}║${NC}"
-    printf '%s\n' "${CYAN}╚════════════════════════════════════════════╝${NC}"
+    printf '%s\n' "${CYAN}================================================${NC}"
+    printf '%s\n' "${CYAN}${BOLD}           usque-keenetic${NC}"
+    printf '%s\n' "${CYAN}================================================${NC}"
     echo
     printf '%s\n' "${DIM}  Usque — Cloudflare WARP (MASQUE) для Keenetic${NC}"
     printf '%s\n' "${DIM}  интерфейс opkgtun* · маршруты DNS/IP в веб-морде${NC}"
