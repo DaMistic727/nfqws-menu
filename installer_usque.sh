@@ -1160,8 +1160,27 @@ do_remove() {
 
   # бинарник мог остаться после ручного обновления п.2
   if [ -f "$USQUE_BIN" ] && ! is_pkg_installed; then
-    rm -f "$USQUE_BIN" "${USQUE_BIN}.bak" 2>/dev/null || true
+    rm -f "$USQUE_BIN" 2>/dev/null || true
     info "  удалён: $USQUE_BIN"
+  fi
+
+  # .bak от п.2 «Обновление bin»
+  if [ -f "${USQUE_BIN}.bak" ]; then
+    rm -f "${USQUE_BIN}.bak" 2>/dev/null || true
+    info "  удалён: ${USQUE_BIN}.bak"
+  fi
+
+  # статический DNS, который ставили при register (api.cloudflareclient.com → 104.16.24.84)
+  if command -v ndmc >/dev/null 2>&1; then
+    if ndmc_cli "no ip host ${CF_API_HOST}" >/dev/null 2>&1; then
+      ndmc_cli "system configuration save" >/dev/null 2>&1 || true
+      info "  удалён ip host: ${CF_API_HOST}"
+    else
+      # записи могло не быть — не ошибка
+      info "  ip host ${CF_API_HOST}: нет или уже удалён"
+    fi
+  else
+    warn "ndmc нет — уберите вручную: ndmc -c \"no ip host ${CF_API_HOST}\""
   fi
 
   info "Готово."
