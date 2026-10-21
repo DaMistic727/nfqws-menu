@@ -856,48 +856,167 @@ is_usque_running() {
   return 1
 }
 
-# HTTP-проверка через интерфейс usque
+# Cloudflare colo list (кэш в /tmp)
+COLO_CACHE="/tmp/usque-dc-colos.json"
+COLO_LIST_URL="https://raw.githubusercontent.com/Netrvin/cloudflare-colo-list/main/DC-Colos.json"
+
+ensure_colo_cache() {
+  if [ -s "$COLO_CACHE" ]; then
+    # не старше ~7 дней
+    if [ -n "$(find "$COLO_CACHE" -mtime -7 2>/dev/null)" ] || [ -s "$COLO_CACHE" ]; then
+      # find -mtime может отсутствовать на busybox — достаточно наличия файла
+      return 0
+    fi
+  fi
+  info "Справочник colo (Netrvin/cloudflare-colo-list)..."
+  if http_get "$COLO_LIST_URL" "$COLO_CACHE" && [ -s "$COLO_CACHE" ]; then
+    return 0
+  fi
+  rm -f "$COLO_CACHE"
+  return 1
+}
+
+# Расшифровка кода colo → "City, Country"
+lookup_colo() {
+  code="$1"
+  [ -n "$code" ] || return 1
+  # небольшой RU-словарь для частых точек
+  case "$code" in
+    HEL) printf '%s' "Хельсинки, Финляндия"; return 0 ;;
+    ARN) printf '%s' "Стокгольм, Швеция"; return 0 ;;
+    OSL) printf '%s' "Осло, Норвегия"; return 0 ;;
+    CPH) printf '%s' "Копенгаген, Дания"; return 0 ;;
+    FRA) printf '%s' "Франкфурт, Германия"; return 0 ;;
+    AMS) printf '%s' "Амстердам, Нидерланды"; return 0 ;;
+    LHR|LON) printf '%s' "Лондон, Великобритания"; return 0 ;;
+    WAW) printf '%s' "Варшава, Польша"; return 0 ;;
+    VIE) printf '%s' "Вена, Австрия"; return 0 ;;
+    PRG) printf '%s' "Прага, Чехия"; return 0 ;;
+    BUD) printf '%s' "Будапешт, Венгрия"; return 0 ;;
+    RIX) printf '%s' "Рига, Латвия"; return 0 ;;
+    TLL) printf '%s' "Таллин, Эстония"; return 0 ;;
+    LED|SVO|DME|VKO) printf '%s' "Москва, Россия"; return 0 ;;
+    MSQ) printf '%s' "Минск, Беларусь"; return 0 ;;
+    KBP|IEV) printf '%s' "Киев, Украина"; return 0 ;;
+    IST) printf '%s' "Стамбул, Турция"; return 0 ;;
+    DXB) printf '%s' "Дубай, ОАЭ"; return 0 ;;
+    SIN) printf '%s' "Сингапур"; return 0 ;;
+    NRT|HND) printf '%s' "Токио, Япония"; return 0 ;;
+    ICN) printf '%s' "Сеул, Южная Корея"; return 0 ;;
+    LAX) printf '%s' "Лос-Анджелес, США"; return 0 ;;
+    SJC) printf '%s' "Сан-Хосе, США"; return 0 ;;
+    SEA) printf '%s' "Сиэтл, США"; return 0 ;;
+    ORD) printf '%s' "Чикаго, США"; return 0 ;;
+    EWR|JFK|LGA) printf '%s' "Нью-Йорк, США"; return 0 ;;
+    CDG) printf '%s' "Париж, Франция"; return 0 ;;
+    MAD) printf '%s' "Мадрид, Испания"; return 0 ;;
+    MXP|LIN) printf '%s' "Милан, Италия"; return 0 ;;
+    ZRH) printf '%s' "Цюрих, Швейцария"; return 0 ;;
+  esac
+  if ensure_colo_cache 2>/dev/null; then
+    # "HEL": { ... "name": "Helsinki, Finland" ... }
+    name=$(sed -n "/"$code":/,/}/p" "$COLO_CACHE" 2>/dev/null | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    if [ -n "$name" ]; then
+      printf '%s' "$name"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# curl --interface IFACE https://cloudflare.com/cdn-cgi/trace
+show_cf_trace() {
+  ifc="$1"
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl нет — trace недоступен"
+    return 1
+  fi
+  info "Cloudflare trace (cdn-cgi/trace) via $ifc..."
+  trace=$(curl -sS --connect-timeout 5 --max-time 10 --interface "$ifc"     "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null) || trace=""
+  if [ -z "$trace" ]; then
+    warn "trace: нет ответа via $ifc"
+    return 1
+  fi
+  # ключевые поля
+  cf_ip=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -1)
+  cf_colo=$(printf '%s\n' "$trace" | sed -n 's/^colo=//p' | head -1)
+  cf_loc=$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -1)
+  cf_warp=$(printf '%s\n' "$trace" | sed -n 's/^warp=//p' | head -1)
+  cf_http=$(printf '%s\n' "$trace" | sed -n 's/^http=//p' | head -1)
+  cf_tls=$(printf '%s\n' "$trace" | sed -n 's/^tls=//p' | head -1)
+  cf_gateway=$(printf '%s\n' "$trace" | sed -n 's/^gateway=//p' | head -1)
+
+  [ -n "$cf_ip" ] && info "  ip=$cf_ip"
+  if [ -n "$cf_colo" ]; then
+    colo_name=$(lookup_colo "$cf_colo" 2>/dev/null) || colo_name=""
+    if [ -n "$colo_name" ]; then
+      info "  colo=$cf_colo — $colo_name"
+    else
+      info "  colo=$cf_colo"
+    fi
+  fi
+  [ -n "$cf_loc" ] && info "  loc=$cf_loc"
+  [ -n "$cf_warp" ] && info "  warp=$cf_warp"
+  [ -n "$cf_http" ] && info "  http=$cf_http"
+  [ -n "$cf_tls" ] && info "  tls=$cf_tls"
+  [ -n "$cf_gateway" ] && info "  gateway=$cf_gateway"
+
+  # warp=on — ожидаемо для usque/WARP
+  case "$cf_warp" in
+    on|ON) info "  WARP/MASQUE: активен" ;;
+    off|OFF) warn "  WARP: off (трафик не через WARP?)" ;;
+  esac
+  return 0
+}
+
+# HTTP-проверка через интерфейс usque (короткие таймауты — не зависаем)
 check_url_via_iface() {
   # check_url_via_iface IFACE URL LABEL
   ifc="$1"
   url="$2"
   label="$3"
-  code=""
+  code="000"
   err=""
-  if command -v curl >/dev/null 2>&1; then
-    # -k на случай MITM; --interface привязка к tun
-    out=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 15       --interface "$ifc" -L "$url" 2>&1) || true
-    code=$(printf '%s' "$out" | tr -d '\r' | grep -oE '[0-9]{3}$' | tail -1)
-    if [ -z "$code" ]; then
-      err=$(printf '%s' "$out" | tr '\n' ' ' | head -c 120)
-    fi
-  elif command -v wget >/dev/null 2>&1; then
-    # wget без --bind-interface на busybox — только общий путь
-    warn "wget без --interface: проверка $label без привязки к $ifc"
-    if wget -q -O /dev/null -T 15 "$url" 2>/dev/null; then
-      code="200"
-    else
-      err="wget failed"
-    fi
-  else
+  if ! command -v curl >/dev/null 2>&1; then
     error "Нужен curl для проверки через интерфейс."
     return 1
   fi
+  # stderr отдельно, http_code — только на stdout
+  errf="/tmp/usque-curl-err-$$"
+  code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    --connect-timeout 5 --max-time 10 \
+    --interface "$ifc" -L "$url" 2>"$errf") || true
+  code=$(printf '%s' "$code" | tr -d '\r\n ')
+  case "$code" in
+    ''|*[!0-9]*) code="000" ;;
+  esac
+  if [ -s "$errf" ]; then
+    err=$(tr '\n' ' ' < "$errf" | head -c 100)
+  fi
+  rm -f "$errf"
 
   case "$code" in
     2??|3??)
       info "$label: OK (HTTP $code) via $ifc"
       return 0
       ;;
+    000)
+      warn "$label: нет ответа via $ifc (timeout/unreachable)${err:+ — $err}"
+      return 1
+      ;;
     *)
-      if [ -n "$code" ]; then
-        warn "$label: HTTP $code via $ifc"
-      else
-        warn "$label: FAIL via $ifc${err:+ — $err}"
-      fi
+      warn "$label: HTTP $code via $ifc${err:+ — $err}"
       return 1
       ;;
   esac
+}
+
+run_iface_probes() {
+  # run_iface_probes IFACE → печатает ok count в stdout последней строкой? лучше через global
+  _probe_ok=0
+  check_url_via_iface "$1" "https://2ip.io/" "2ip.io" && _probe_ok=$((_probe_ok + 1))
+  check_url_via_iface "$1" "https://www.google.com/" "google.com" && _probe_ok=$((_probe_ok + 1))
+  check_url_via_iface "$1" "https://web.telegram.org/" "web.telegram.org" && _probe_ok=$((_probe_ok + 1))
 }
 
 do_check_iface() {
@@ -909,11 +1028,22 @@ do_check_iface() {
   if ! is_usque_running; then
     error "Сервис usque не запущен."
     echo "  Запуск: $INIT_SCRIPT start"
-    return 1
+    if confirm_yes "Запустить сервис сейчас?"; then
+      if [ -x "$INIT_SCRIPT" ]; then
+        "$INIT_SCRIPT" start 2>&1 || true
+      fi
+      if ! is_usque_running; then
+        error "Сервис так и не запустился."
+        return 1
+      fi
+      info "Сервис: запущен"
+    else
+      return 1
+    fi
+  else
+    info "Сервис: запущен"
   fi
-  info "Сервис: запущен"
 
-  # интерфейс в системе
   if ip link show "$iface" >/dev/null 2>&1 || ifconfig "$iface" >/dev/null 2>&1; then
     info "Интерфейс $iface: есть в системе"
   else
@@ -921,20 +1051,41 @@ do_check_iface() {
   fi
 
   echo
-  ok=0
-  check_url_via_iface "$iface" "https://www.google.com/" "google.com" && ok=$((ok + 1))
-  check_url_via_iface "$iface" "https://web.telegram.org/" "web.telegram.org" && ok=$((ok + 1))
+  run_iface_probes "$iface"
+  ok=$_probe_ok
   echo
-  if [ "$ok" -eq 2 ]; then
-    info "Проверка пройдена: оба хоста доступны через $iface"
+  # Cloudflare colo / WARP trace
+  show_cf_trace "$iface" || true
+  echo
+  if [ "$ok" -ge 2 ]; then
+    info "Проверка пройдена: $ok/3 хостов доступны через $iface"
     return 0
-  elif [ "$ok" -eq 1 ]; then
-    warn "Частично: доступен 1 из 2 хостов через $iface"
-    return 1
-  else
-    error "Оба хоста недоступны через $iface"
-    return 1
   fi
+
+  # процесс жив, но туннель «тухлый» — часто лечится restart
+  warn "Слабый/нулевой ответ через $iface ($ok/3). Туннель мог «залипнуть»."
+  if [ -x "$INIT_SCRIPT" ] && confirm_yes "Перезапустить usque и проверить снова?"; then
+    info "Restart..."
+    "$INIT_SCRIPT" restart 2>&1 || {
+      "$INIT_SCRIPT" stop 2>/dev/null || true
+      "$INIT_SCRIPT" start 2>&1 || true
+    }
+    sleep 2
+    echo
+    run_iface_probes "$iface"
+    ok=$_probe_ok
+    echo
+    show_cf_trace "$iface" || true
+    echo
+    if [ "$ok" -ge 2 ]; then
+      info "После restart: $ok/3 OK через $iface"
+      return 0
+    fi
+  fi
+
+  error "Хосты недоступны через $iface ($ok/3)"
+  printf '%s\n' "${DIM}Вручную: curl --interface $iface -m 10 -L https://2ip.io/${NC}"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
