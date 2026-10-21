@@ -72,6 +72,22 @@ service_is_up() {
   esac
 }
 
+# Порт слушается? (0 = занят, 1 = свободен) — как в nfqws-menu.sh
+port_is_open() {
+  local port="$1" ok=1
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lnt 2>/dev/null | grep -qE "[.:]${port}[[:space:]]" && ok=0
+  elif command -v ss >/dev/null 2>&1; then
+    ss -lnt 2>/dev/null | grep -qE "[.:]${port}[[:space:]]" && ok=0
+  elif [ -r /proc/net/tcp ]; then
+    grep -q ":$(printf '%04X' "$port") " /proc/net/tcp 2>/dev/null && ok=0
+  fi
+  return "$ok"
+}
+
+# Подпись для ask (в меню задаётся ui_apply_lang)
+: "${LBL_YOUR_CHOICE:=Ваш выбор}"
+
 # Простое скачивание install.sh (с зеркалами raw.githubusercontent)
 download_sh_validated() {
   local url="$1" dest="$2" min_bytes="${3:-1000}"

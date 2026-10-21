@@ -4,10 +4,10 @@
 
 Репозиторий также служит хранилищем готовых **стратегий** обхода DPI, **blobs** и **lists**.
 
-- Скрипт: [`nfqws-menu.sh`](nfqws-menu.sh) (текущая версия **0.10.1**)
-- Стратегии: [`strategies/`](strategies/)
-- Hosts: [`hosts`](hosts)
-- Контрольные суммы: [`SHA256SUMS`](SHA256SUMS), [`strategies/blobs/SHA256SUMS`](strategies/blobs/SHA256SUMS)
+- Скрипт: `nfqws-menu.sh` (текущая версия **0.10.8**)
+- Стратегии: `strategies/`
+- Hosts: `hosts`
+- Контрольные суммы: `SHA256SUMS`, `strategies/blobs/SHA256SUMS`
 
 ### Официальные проекты
 
@@ -78,7 +78,7 @@ menu
 
 При запуске скрипт:
 
-1. Определяет архитектуру: **`opkg print-architecture`** (основной) → при ошибке **`/opt/etc/opkg.conf`** → fallback `uname -m`. На части Keenetic `uname`/RCI отдают `mips` вместо `mipsel` — поэтому opkg приоритетнее.
+1. Определяет архитектуру: `opkg print-architecture` (основной) → при ошибке `/opt/etc/opkg.conf` → fallback `uname -m`. На части Keenetic `uname`/RCI отдают `mips` вместо `mipsel` — поэтому opkg приоритетнее.
 2. Заголовок: **Модель / Title / ARCH** из RCI (`/rci/show/version`). ARCH зелёный (из opkg) или жёлтый (из conf/uname). Если в RCI нет `opkg-kmod-netfilter` — красное предупреждение установить «Модули ядра подсистемы Netfilter».
 3. Показывает **только установленные** компоненты (версии и статус) одним проходом awk по status/process-кэшу:
    - пакеты NFQWS / web, usque-keenetic, **tg-ws-proxy-rs**, magitrickle;
@@ -99,7 +99,6 @@ menu
       6.  Смена активных fake:blob
       7.  Обновление hosts
       8.  Управление DoT/DoH
-      9.  Discord: все пакеты в nfqws2
 
 [::]  УТИЛИТЫ
       10. dpi-detector
@@ -154,7 +153,7 @@ menu
 - Показывает список `.conf` из:
   - `strategies/nfqws1/` — для v1
   - `strategies/nfqws2/` — для v2
-- Список стратегий: **`SHA256SUMS`** → GitHub API → **локальный offline-кэш** (`/opt/etc/nfqws-menu/strategies/…`).
+- Список стратегий: `SHA256SUMS` → GitHub API → **локальный offline-кэш** (`/opt/etc/nfqws-menu/strategies/…`).
 - Скачивание: основной raw GitHub → зеркала **jsDelivr / Fastly jsDelivr / ghproxy** → fallback через туннель-интерфейсы (`awg0`, `t2s0`, …); успешный файл сохраняется в offline-кэш.
 - Делает **бэкап** текущего конфига и применяет стратегию.
 - Перед записью **нормализует CRLF → LF** (иначе `source`/iptables: `: not found`, `invalid port/service`).
@@ -166,21 +165,21 @@ menu
 - Определяет интерфейс провайдера из default route (`ip route` / `route`), сравнивает с `ISP_INTERFACE` в конфиге и при необходимости предлагает установить правильное значение. При чтении значения снимаются `\r`, кавычки и пробелы (защита от CRLF в выводе меню).
 - Проверяет наличие **глобального IPv6** (`scope global`: 2a00, 2a02, 2606, 2001, …) на выбранном `ISP_INTERFACE` (или default route) и выставляет `IPV6_ENABLED=0|1`. Несколько iface через пробел — достаточно одного с global.
 
-#### Восстановление rkn.list и POLICY_*
+#### Восстановление rkn.list и POLICY\_\*
 
 - Если до смены стратегии в `MODE_LIST` уже был `--hostlist=…/rkn.list`, привязка **восстанавливается** автоматически.
-- **`POLICY_NAME` / `POLICY_EXCLUDE`**: стандартные значения (`nfqws` / `0`) не трогаются; **нестандартные** предлагается восстановить (**по умолчанию: Нет**).
+- `POLICY_NAME` **/** `POLICY_EXCLUDE`: стандартные значения (`nfqws` / `0`) не трогаются; **нестандартные** предлагается восстановить (**по умолчанию: Нет**).
 
 #### Проверка blobs (наличие + SHA256)
 
 Парсит установленный конфиг и находит используемые `.bin` (`--blob=…`, `--dpi-desync-fake-tls=…`, `--dpi-desync-fake-quic=…` и абсолютные пути).
 
-- Сверяет локальные файлы с эталоном [`strategies/blobs/SHA256SUMS`](strategies/blobs/SHA256SUMS) (`sha256sum` или `openssl dgst -sha256`; кэш SUMS ~1 ч).
+- Сверяет локальные файлы с эталоном `strategies/blobs/SHA256SUMS` (`sha256sum` или `openssl dgst -sha256`; кэш SUMS \~1 ч).
 - Отсутствующие или **устаревшие/повреждённые** (хеш не совпал) предлагает скачать заново; после загрузки — повторная проверка SHA256 (при несовпадении файл удаляется).
 
 #### Обновление lists
 
-По запросу обновляет из `strategies/lists/`: `user.list`, `exclude.list`, `ipset.list`, `ipset_exclude.list`.  
+По запросу обновляет из `strategies/lists/`: `user.list`, `exclude.list`, `ipset.list`, `ipset_exclude.list`.\
 `auto.list` **не трогается** — его заполняет демон.
 
 После всех шагов соответствующий сервис перезапускается.
@@ -217,8 +216,8 @@ menu
 
 Добавляет в `NFQWS_ARGS_CUSTOM` стратегию обхода блокировок публичных DoT/DoH DNS:
 
-- **nfqws1** — [`strategies/dns_filter_nfqws1`](strategies/dns_filter_nfqws1) (классический `--dpi-desync`)
-- **nfqws2** — [`strategies/dns_filter_nfqws2`](strategies/dns_filter_nfqws2) (lua-desync)
+- **nfqws1** — `strategies/dns_filter_nfqws1` (классический `--dpi-desync`)
+- **nfqws2** — `strategies/dns_filter_nfqws2` (lua-desync)
 
 Покрывает Cloudflare, Google, AdGuard, NextDNS, Quad9, DNS.SB, Alibaba, Xbox-DNS, Geohide и др.; при необходимости добавляет порт `853` в `TCP_PORTS` / `UDP_PORTS` и перезапускает соответствующий сервис (`S51nfqws` / `S51nfqws2`). Стратегия сначала скачивается с GitHub, при недоступности сети — встроенный fallback.
 
@@ -228,7 +227,7 @@ menu
 
 - Быстрый разбор конфига (v1/v2) одним проходом **awk**: секции `NFQWS_*ARGS*`, map `--blob=name:path`, уникальные `fake:blob=` (hex пропускаются).
 - Показывает список найденных имён по секциям.
-- Кандидаты `.bin`: локальные → имена из **`strategies/blobs/SHA256SUMS`** → GitHub API → встроенный fallback.
+- Кандидаты `.bin`: локальные → имена из `strategies/blobs/SHA256SUMS` → GitHub API → встроенный fallback.
 - При выборе файла из репозитория — скачивает его, обновляет `--blob=…`, бэкап конфига.
 - Перезапуск сервиса — по подтверждению (по умолчанию Да).
 
@@ -283,40 +282,6 @@ menu
 > Нужен `ndmc` (CLI Keenetic/Netcraze).\
 > При активном **Интернет-фильтре** часть DoT может помечаться как *disregarded*.
 
-### 9. Discord: все пакеты в nfqws2
-
-Для **nfqws2-keenetic**. Убирает потери в голосе и демонстрации экрана Discord, когда обход делает
-роутер, а не компьютер (Flowseal / winws).
-
-nfqws2-keenetic отдаёт nfqws2 только первые 15 пакетов соединения, дальше Keenetic передаёт поток в
-аппаратное/программное ускорение. winws на компьютере пропускает через себя каждый пакет. Пункт делает
-так же на роутере: UDP на порты Discord (`19294:19344,50000:50100`) идёт в `nfqws2` весь звонок, а эти
-потоки исключаются из ускорения штатной целью прошивки `-j PPE`. Остальной трафик ускоряется как раньше.
-
-Запускает [`nfqws2_fullsession.sh`](nfqws2_fullsession.sh) (отдельно: `sh nfqws2_fullsession.sh` — меню,
-`status | apply | xkeen | remove` — без меню):
-
-```
-1) Статус / диагностика
-2) Включить фикс
-3) Выключить фикс и удалить
-4) XKeen: исключить порты Discord      (если установлен XKeen)
-```
-
-- **Включить** — цепочки `nfqws_full_post` / `nfqws_full_fwd`, init-скрипт `S52nfqws2-fullsession` и хук
-  `netfilter.d/101-nfqws2-fullsession.sh`, который возвращает правила, когда прошивка перезаписывает
-  таблицу. Скрипт копирует себя в `/opt/etc/nfqws2-fullsession/`; пакет `nfqws2-keenetic` не меняется.
-  После включения нужно переподключиться к голосовому каналу.
-- **Статус** — правила, потери в очереди, потоки звонка в ускорении (если не 0 — переподключиться),
-  журнал `/tmp/nfqws2-fullsession.log`.
-- **XKeen** — добавляет порты Discord в `port_exclude.lst`, чтобы голос не уходил в Xray.
-
-Стратегию пункт не меняет: голос Discord должен подключаться со стратегией из п. 2 (проверено с
-профилем Discord без `--out-range`, как в `alt*`).
-
-Через `nfqws2` идут все пакеты звонка: отбор только части пакетов проверялся — потери возвращаются.
-Нагрузка — около 1 % одного ядра на стрим (Netcraze NC-1812).
-
 ### 10. dpi-detector
 
 Инструмент для анализа цензуры трафика в России: обнаруживает и классифицирует блокировки сайтов, хостингов и CDN (TCP16–20 блокировки), а также подмену DNS-запросов провайдером.
@@ -352,7 +317,7 @@ curl -sL https://raw.githubusercontent.com/rndnaame/awg-compressed/main/install-
 
 Адаптация неофициального клиента Cloudflare WARP с режимом MASQUE для роутеров Keenetic / Netcraze.
 
-Через [`installer_usque.sh`](https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_usque.sh) (пункт меню 13 или напрямую):
+Через `installer_usque.sh` (пункт меню 13 или напрямую):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_usque.sh | sh
@@ -360,7 +325,7 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 
 Подменю:
 
-1. **Установка** — пакет [usque-keenetic](https://github.com/side-effect-tm/usque-keenetic) (opkg, репозиторий `side-effect-tm.github.io/usque-keenetic/all`)
+1. **Установка** — пакет [usque-keenetic](https://github.com/side-effect-tm/usque-keenetic) (opkg, репозиторий `…/usque-keenetic/$ARCH`, fallback `/all`)
 2. **Обновление bin** — бинарник [Diniboy1123/usque](https://github.com/Diniboy1123/usque) с GitHub Releases → `/opt/usr/bin/usque` (aarch64→arm64, mipsel→mipsle, mips→mips, x86_64→amd64)
 3. **Удаление** — `opkg remove --autoremove usque-keenetic` + conf репозитория; опционально `/opt/etc/usque`
 
@@ -410,20 +375,26 @@ Telegram MTProto-прокси на Rust (полная реализация оф�
 | Пункт | Действие |
 | --- | --- |
 | 1 | **Сжать bin/sbin (UPX)** — `upx --lzma --best` для `/opt/bin`, `/opt/sbin`, `/opt/usr/bin`, `/opt/libexec` (при необходимости ставит `upx`) |
-| 2 | **Dropbear fix** — скрипт `sw.ext.io/ent/_addons/dropbear_fix` (с опцией сброса пароля root или без) |
+| 2 | **Dropbear fix** — правки conf/init Entware dropbear (с опцией сброса пароля root или без) |
+| 3 | **Починить OPKG** — снятие залипших lock opkg, дедуп `src/gz` entware/keendev, починка битого `status` (NUL → segfault), выравнивание arch-path в `/opt/etc/opkg.conf` |
 | U | **Обновить все пакеты** — `opkg update && opkg upgrade` (также клавиша **U** из главного меню) |
 
 ### 16. TG WS Proxy Rust (tg-ws-proxy-rs)
 
-[tg-ws-proxy-rs](https://github.com/valnesfjord/tg-ws-proxy-rs) — MTProto-прокси на Rust. В opkg его нет: ставит штатный `install.sh` проекта, он же пишет конфиг и Entware-инициализацию. Меню добавляет:
+Через `installer_tgws_rs.sh` (пункт меню **16** или напрямую):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_tgws_rs.sh | sh
+```
+
+[tg-ws-proxy-rs](https://github.com/valnesfjord/tg-ws-proxy-rs) — MTProto-прокси на Rust. В opkg его нет: ставит штатный `install.sh` проекта, он же пишет конфиг и Entware-инициализацию. Установщик меню добавляет:
 
 - **секрет и порт прежней Go-установки** (если осталась) — ссылки `tg://` не меняются, Go-сервис останавливается и снимается с автозапуска;
 - **выбор сборки** — обычная или компактная (UPX), таблицей: размер на флеше и потребление памяти. По умолчанию обычная; компактная — когда флеш-памяти мало (образ распаковывается в ОЗУ и не вытесняется);
 - **подбор параметров по замерам** — CF-домены и варианты лестницы проверяются штатной пробой бинаря, затем выводится список с временем каждого, и путь выбираете вы (Enter — быстрейший);
 - **проверка связи до выдачи ссылки** — `resPQ` от DC Telegram, то есть вся цепочка, а не «порт открыт».
 
-Конфиги: `/opt/etc/tg-ws-proxy-rs/config.conf` (`DC_IP`, `CF_DOMAIN`, `EXTRA_ARGS`), `secret.conf` рядом с ним.
-Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
+Конфиги: `/opt/etc/tg-ws-proxy-rs/config.conf` (`DC_IP`, `CF_DOMAIN`, `EXTRA_ARGS`), `secret.conf` рядом с ним. Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
 
 Проба есть с версии **2.4.5**; у более старого бинаря меню предложит обновиться.
 
@@ -433,13 +404,13 @@ Init: `/opt/etc/init.d/S99tg-ws-proxy-rs` (start / stop / status / restart)
 
 [firc](https://github.com/hoaxisr/firc) — утилита для **точечной маршрутизации трафика по доменам** (FakeIP) на Keenetic / Entware. Нужные домены заворачиваются в выбранный интерфейс (VPN / туннель), остальной трафик не затрагивается.
 
-Через [`installer_firc.sh`](https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh) (пункт меню **17** или напрямую):
+Через `installer_firc.sh` (пункт меню **17** или напрямую):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh | sh
 ```
 
-1. **Установка / обновление firc** — `src/gz hoaxisr` → `/opt/etc/opkg/awg_manager.conf` ([repo.hoaxisr.ru](https://repo.hoaxisr.ru/)), затем **`opkg update && opkg install firc`**
+1. **Установка / обновление firc** — `src/gz hoaxisr` → `/opt/etc/opkg/awg_manager.conf` ([repo.hoaxisr.ru](https://repo.hoaxisr.ru/)), затем `opkg update && opkg install firc`
 2. **Удаление firc** — `opkg remove` (`awg_manager.conf` не трогаем)
 3. **Полное меню** — remote `installer_firc.sh` (диагностика и т.п.)
 
@@ -485,6 +456,13 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 
 ## Changelog
 
+### 0.10.7
+
+- Версия скрипта **0.10.7**; README синхронизирован с меню
+- **S → 3. Починить OPKG** — lock/status/`src/gz`/arch-path
+- **п. 16** — установка через `installer_tgws_rs.sh` репозитория
+- **п. 17 firc** — через `installer_firc.sh`
+
 ### 0.10.4
 
 - **п. 17 firc** — снова только remote `installer_firc.sh` (без встраивания логики в меню)
@@ -504,7 +482,6 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 ### 0.9.84
 
 - **п. 17** — **firc** ([hoaxisr/firc](https://github.com/hoaxisr/firc), [repo.hoaxisr.ru](https://repo.hoaxisr.ru/)): opkg install из фида; статус в show_installed
-
 
 ### 0.9.x
 
@@ -571,7 +548,7 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 
 ### 0.6.36 – 0.6.39
 
-- **LBL_*** — подписи пунктов совпадают с номерами меню (`LBL_5`…`LBL_9`; удалён `LBL_7F`)
+- **LBL\_**\* — подписи пунктов совпадают с номерами меню (`LBL_5`…`LBL_9`; удалён `LBL_7F`)
 - **DoT/DoH пресеты** — Google, AdGuard Default/Family, ControlD Free, DNS4EU, Alibaba DNS, DNSPod; убраны нерабочие Tiar Japan
 - **proc_running** — `grep -qF --` (fix при именах сервисов с ведущим `-`)
 
@@ -583,7 +560,7 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 - **Загрузки** — при блокировке основного канала `curl --interface` через туннели (`awg0`, `t2s0`, `nwg0`, `opkgtun0`, …); короткие таймауты
 - **CI** — workflow `.github/workflows/sha256sums.yml` обновляет `SHA256SUMS` и `strategies/blobs/SHA256SUMS` (push / daily / manual)
 - **п. 3** — авто `IPV6_ENABLED` по наличию глобального IPv6 на ISP-интерфейсе; сохранение привязки **rkn.list** в `MODE_LIST` при смене стратегии
-- **DNS (п. 9)** — парсер только секция System (`proxy-tls` / `proxy-https`); Policy* и `*-filters` игнорируются
+- **DNS (п. 9)** — парсер только секция System (`proxy-tls` / `proxy-https`); Policy\* и `*-filters` игнорируются
 
 ### 0.6.23 – 0.6.25
 
@@ -666,7 +643,6 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 ```
 nfqws-menu/
 ├── nfqws-menu.sh          # Главный скрипт меню
-├── nfqws2_fullsession.sh  # П. 9: фикс потерь в голосе/стриме Discord (nfqws2)
 ├── hosts                  # Секции IP DOMAIN для п. 8 (ndmc ip host)
 ├── SHA256SUMS             # Хеши файлов репозитория (список стратегий без API)
 ├── README.md
