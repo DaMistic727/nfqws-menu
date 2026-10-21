@@ -780,10 +780,11 @@ do_update_bin() {
     return 1
   fi
 
-  # Остановка сервиса перед заменой
+  # Остановка перед заменой + пауза (иначе start после смены bin часто «пустой»)
   if [ -x "$INIT_SCRIPT" ]; then
     info "Остановка сервиса..."
     "$INIT_SCRIPT" stop 2>/dev/null || true
+    sleep 1
   fi
 
   mkdir -p "$(dirname "$USQUE_BIN")"
@@ -810,7 +811,27 @@ do_update_bin() {
     ensure_session || true
   elif [ -x "$INIT_SCRIPT" ]; then
     info "Запуск сервиса..."
-    "$INIT_SCRIPT" start 2>/dev/null || warn "Не удалось запустить $INIT_SCRIPT"
+    "$INIT_SCRIPT" start 2>&1 || warn "Не удалось запустить $INIT_SCRIPT"
+    # дать MASQUE/туннелю подняться
+    sleep 3
+    iface=$(get_usque_iface)
+    info "Проверка туннеля via $iface..."
+    if check_url_via_iface "$iface" "https://2ip.io/" "2ip.io"; then
+      info "Туннель OK"
+    else
+      warn "Туннель не ответил после start — restart..."
+      "$INIT_SCRIPT" restart 2>&1 || {
+        "$INIT_SCRIPT" stop 2>/dev/null || true
+        sleep 1
+        "$INIT_SCRIPT" start 2>&1 || true
+      }
+      sleep 3
+      if check_url_via_iface "$iface" "https://2ip.io/" "2ip.io"; then
+        info "Туннель OK после restart"
+      else
+        warn "Туннель всё ещё не отвечает. Проверьте п.3 или: $INIT_SCRIPT restart"
+      fi
+    fi
   fi
 
   rm -rf "$TMPDIR"
