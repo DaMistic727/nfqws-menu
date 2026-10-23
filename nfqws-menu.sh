@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.10.8"
+SCRIPT_VERSION="0.10.10"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -1416,7 +1416,7 @@ install_nfqws1() {
     fi
   fi
   install_deps
-  ensure_opkg_repo "nfqws-keenetic" "https://nfqws.github.io/nfqws-keenetic/$ARCH"
+  ensure_opkg_repo "nfqws-keenetic" "$(_opkg_nfqws_sw_base nfqws "$ARCH")"
   if opkg install nfqws-keenetic; then
     refresh_opkg_cache
     if is_installed "nfqws-keenetic"; then
@@ -1448,7 +1448,7 @@ install_nfqws2() {
     fi
   fi
   install_deps
-  ensure_opkg_repo "nfqws2-keenetic" "https://nfqws.github.io/nfqws2-keenetic/$ARCH"
+  ensure_opkg_repo "nfqws2-keenetic" "$(_opkg_nfqws_sw_base nfqws2 "$ARCH")"
   if opkg install nfqws2-keenetic; then
     refresh_opkg_cache
     if is_installed "nfqws2-keenetic"; then
@@ -1726,19 +1726,29 @@ menu_install_ipk_direct() {
 
   need_arch || return 1
 
-  base1="https://nfqws.github.io/nfqws-keenetic/${ARCH}"
-  base2="https://nfqws.github.io/nfqws2-keenetic/${ARCH}"
-  baseweb="https://nfqws.github.io/nfqws-keenetic-web/all"
+  base1=$(_opkg_nfqws_sw_base nfqws "$ARCH")
+  base2=$(_opkg_nfqws_sw_base nfqws2 "$ARCH")
+  baseweb=$(_opkg_nfqws_sw_base web all)
 
   info "Запрос крайних версий .ipk (архитектура: $ARCH) ..."
   meta=$(fetch_ipk_meta "$base1" "nfqws-keenetic" 2>/dev/null) && v1=$(printf '%s\n' "$meta" | head -1 | cut -f1 | tr -d '\r')
   meta=$(fetch_ipk_meta "$base2" "nfqws2-keenetic" 2>/dev/null) && v2=$(printf '%s\n' "$meta" | head -1 | cut -f1 | tr -d '\r')
   meta=$(fetch_ipk_meta "$baseweb" "nfqws-keenetic-web" 2>/dev/null) && vweb=$(printf '%s\n' "$meta" | head -1 | cut -f1 | tr -d '\r')
+  # fallback github.io если sw.ext.io недоступен
+  if [ -z "$v1" ] || [ "$v1" = "?" ]; then
+    meta=$(fetch_ipk_meta "https://nfqws.github.io/nfqws-keenetic/${ARCH}" "nfqws-keenetic" 2>/dev/null) && v1=$(printf '%s\n' "$meta" | head -1 | cut -f1 | tr -d '\r')
+  fi
+  if [ -z "$v2" ] || [ "$v2" = "?" ]; then
+    meta=$(fetch_ipk_meta "https://nfqws.github.io/nfqws2-keenetic/${ARCH}" "nfqws2-keenetic" 2>/dev/null) && v2=$(printf '%s\n' "$meta" | head -1 | cut -f1 | tr -d '\r')
+  fi
+  if [ -z "$vweb" ] || [ "$vweb" = "?" ]; then
+    meta=$(fetch_ipk_meta "https://nfqws.github.io/nfqws-keenetic-web/all" "nfqws-keenetic-web" 2>/dev/null) && vweb=$(printf '%s\n' "$meta" | head -1 | cut -f1 | tr -d '\r')
+  fi
   [ -z "$v1" ] && v1="?"
   [ -z "$v2" ] && v2="?"
   [ -z "$vweb" ] && vweb="?"
   if [ "$v1" = "?" ] && [ "$v2" = "?" ] && [ "$vweb" = "?" ]; then
-    warn "Не удалось получить версии (github.io / GitHub). Проверьте сеть или туннель."
+    warn "Не удалось получить версии (sw.ext.io / github.io). Проверьте сеть или туннель."
   fi
 
   echo
@@ -1818,7 +1828,7 @@ menu_install_nfqws() {
 install_web() {
   info "Установка nfqws-keenetic-web..."
   install_deps
-  ensure_opkg_repo "nfqws-keenetic-web" "https://nfqws.github.io/nfqws-keenetic-web/all"
+  ensure_opkg_repo "nfqws-keenetic-web" "$(_opkg_nfqws_sw_base web all)"
   opkg install nfqws-keenetic-web
   info "Веб-интерфейс установлен."
   info "Адрес: http://<IP-роутера>:90"
@@ -5834,18 +5844,40 @@ _opkg_prepare_env() {
   fi
 }
 
-# opkg update: 0 = успех; 1 = ошибка. Ловим segfault (rc 139).
+# opkg update с жёстким лимитом (сек). Без него зависает на github.io / DPI.
+# $1 = max секунд (по умолчанию 90). 0 = успех; 124 = timeout; иначе код opkg.
 _opkg_do_update() {
-  local log="/tmp/opkg-upd-$$.log" rc=0
+  local maxt="${1:-90}" log="/tmp/opkg-upd-$$.log" rc=0 pid i=0
+  case "$maxt" in ''|*[!0-9]*) maxt=90 ;; esac
+  [ "$maxt" -lt 15 ] && maxt=15
   _opkg_prepare_env
-  opkg update >"$log" 2>&1 || rc=$?
+  rm -f "$log"
+  : > "$log"
+  opkg update >>"$log" 2>&1 &
+  pid=$!
+  while [ "$i" -lt "$maxt" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null
+      rc=$?
+      break
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "opkg update: таймаут ${maxt}с — обрыв (часто nfqws.github.io / DPI)."
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    opkg_kill_others 2>/dev/null || true
+    printf '\n[timeout after %ss]\n' "$maxt" >>"$log"
+    rc=124
+  fi
   cat "$log" 2>/dev/null || true
   rm -f /tmp/opkg-upd-last.log
   mv "$log" /tmp/opkg-upd-last.log 2>/dev/null || true
   if [ "$rc" -eq 139 ] || [ "$rc" -eq 11 ]; then
     error "opkg update: Segmentation fault (rc=$rc)"
     warn "Частая причина: busybox wget вместо wget-ssl."
-    warn "Проверьте: ls -la /opt/bin/wget /opt/usr/bin/wget; PATH=/opt/bin:\$PATH opkg update"
   fi
   return "$rc"
 }
@@ -5897,20 +5929,80 @@ _opkg_disable_repo() {
   fi
 }
 
-# Простые доп. репо: список мёртвых → спросить → отключить. Без зеркал.
-# Если wget/opkg сломан (wget returned 255 на всём) — не трогаем репо.
+# github.io → sw.ext.io зеркало (opkg feed).
+# nfqws.github.io/nfqws2-keenetic/aarch64 → https://sw.ext.io/nfqws2/aarch64
+_opkg_github_io_to_sw() {
+  local url="$1" path arch=""
+  case "$url" in
+    *nfqws.github.io/nfqws2-keenetic/*|*sw.ext.io/nfqws2/*)
+      path="${url##*nfqws2-keenetic/}"
+      case "$url" in *sw.ext.io/nfqws2/*) path="${url##*nfqws2/}" ;; esac
+      path="${path%/}"
+      case "$path" in
+        aarch64*|arm64*) arch=aarch64 ;;
+        mipsel*) arch=mipsel ;;
+        mips*) arch=mips ;;
+        all*|*) arch=all ;;
+      esac
+      case "$path" in aarch64|mipsel|mips|all) arch="$path" ;; esac
+      printf 'https://sw.ext.io/nfqws2/%s\n' "$arch"
+      ;;
+    *nfqws.github.io/nfqws-keenetic-web*|*sw.ext.io/nfqws-web*)
+      printf 'https://sw.ext.io/nfqws-web/all\n'
+      ;;
+    *nfqws.github.io/nfqws-keenetic/*|*sw.ext.io/nfqws/*)
+      path="${url##*nfqws-keenetic/}"
+      case "$url" in *sw.ext.io/nfqws/*) path="${url##*nfqws/}" ;; esac
+      path="${path%/}"
+      case "$path" in
+        aarch64*|arm64*) arch=aarch64 ;;
+        mipsel*) arch=mipsel ;;
+        mips*) arch=mips ;;
+        all*|*) arch=all ;;
+      esac
+      case "$path" in aarch64|mipsel|mips|all) arch="$path" ;; esac
+      printf 'https://sw.ext.io/nfqws/%s\n' "$arch"
+      ;;
+  esac
+}
+
+# База sw.ext.io для пакета по ARCH (aarch64|mipsel|mips|…).
+_opkg_nfqws_sw_base() {
+  local kind="$1" a="$2" arch
+  case "$a" in
+    aarch64|arm64) arch=aarch64 ;;
+    mipsel) arch=mipsel ;;
+    mips) arch=mips ;;
+    *) arch=all ;;
+  esac
+  case "$kind" in
+    nfqws2|nfqws2-keenetic) printf 'https://sw.ext.io/nfqws2/%s\n' "$arch" ;;
+    web|nfqws-keenetic-web|nfqws-web) printf 'https://sw.ext.io/nfqws-web/all\n' ;;
+    nfqws|nfqws-keenetic|*) printf 'https://sw.ext.io/nfqws/%s\n' "$arch" ;;
+  esac
+}
+
+# Переписать src/gz name url в файле conf.
+_opkg_rewrite_repo_url() {
+  local f="$1" name="$2" newurl="$3"
+  if [ "$f" = "/opt/etc/opkg.conf" ]; then
+    sed -i "s|^src/gz ${name} .*|src/gz ${name} ${newurl}|" "$f" 2>/dev/null || true
+  else
+    printf 'src/gz %s %s\n' "$name" "$newurl" > "$f"
+  fi
+}
+
+# Доп. репо: github.io → sw.ext.io; иначе список мёртвых → отключить.
 _opkg_heal_extra_repos() {
-  local f line name url fail="/tmp/opkg-fail-$$.txt" nfail=0 removed=0
-  local dir="/opt/etc/opkg" log="/tmp/opkg-upd-last.log"
+  local f line name url fail="/tmp/opkg-fail-$$.txt" nfail=0 removed=0 fixed=0
+  local dir="/opt/etc/opkg" log="/tmp/opkg-upd-last.log" sw_url sw_http
 
   _opkg_dedupe_entware || true
 
-  # Ложные «мёртвые репо»: opkg/wget 255 на всех URL, включая рабочий entware
   if [ -f "$log" ] && grep -q 'wget returned 255' "$log" 2>/dev/null; then
     if grep -qE 'Failed to download.*(entware|bin\.entware|sw\.ext\.io/entware)' "$log" 2>/dev/null; then
       error "opkg/wget не качает даже основной feed (wget returned 255)."
       warn "Это не «мёртвые репо» — сначала wget-ssl / PATH (/opt/bin раньше busybox)."
-      warn "Проверка: PATH=/opt/bin:\$PATH wget -O /dev/null http://sw.ext.io/entware/aarch64-k3.10/Packages.gz"
       return 1
     fi
   fi
@@ -5930,6 +6022,36 @@ _opkg_heal_extra_repos() {
           if _opkg_repo_reachable "$url"; then
             continue
           fi
+          # github.io / старый URL → зеркало sw.ext.io
+          sw_url=$(_opkg_github_io_to_sw "$url" 2>/dev/null || true)
+          if [ -z "$sw_url" ]; then
+            case "$name" in
+              nfqws2-keenetic|nfqws2) sw_url=$(_opkg_nfqws_sw_base nfqws2 "${ARCH:-all}") ;;
+              nfqws-keenetic-web|nfqws-web) sw_url=$(_opkg_nfqws_sw_base web all) ;;
+              nfqws-keenetic|nfqws) sw_url=$(_opkg_nfqws_sw_base nfqws "${ARCH:-all}") ;;
+            esac
+          fi
+          if [ -n "$sw_url" ] && [ "$sw_url" != "$url" ]; then
+            printf '  %s … нет → sw.ext.io … ' "$name"
+            if _opkg_repo_reachable "$sw_url"; then
+              _opkg_print_probe 1 200
+              printf ' → %s\n' "$sw_url"
+              _opkg_rewrite_repo_url "$f" "$name" "$sw_url"
+              fixed=$((fixed + 1))
+              continue
+            fi
+            # HTTP fallback (DPI на HTTPS)
+            sw_http=$(printf '%s\n' "$sw_url" | sed 's|^https://|http://|')
+            if [ "$sw_http" != "$sw_url" ] && _opkg_repo_reachable "$sw_http"; then
+              _opkg_print_probe 1 200
+              printf ' → %s\n' "$sw_http"
+              _opkg_rewrite_repo_url "$f" "$name" "$sw_http"
+              fixed=$((fixed + 1))
+              continue
+            fi
+            _opkg_print_probe 0 200
+            printf '\n'
+          fi
           printf '%s|%s|%s\n' "$f" "$name" "$url" >> "$fail"
           nfail=$((nfail + 1))
           ;;
@@ -5939,6 +6061,7 @@ _opkg_heal_extra_repos() {
 
   if [ "$nfail" -eq 0 ]; then
     rm -f "$fail"
+    [ "$fixed" -gt 0 ] && return 0
     return 1
   fi
 
@@ -5960,7 +6083,8 @@ _opkg_heal_extra_repos() {
   case "$ans" in n|N|н|Н)
     info "Оставляем как есть."
     rm -f "$fail"
-    return 1
+    [ "$fixed" -gt 0 ]
+    return $?
     ;;
   esac
 
@@ -5969,7 +6093,7 @@ _opkg_heal_extra_repos() {
     removed=$((removed + 1))
   done < "$fail"
   rm -f "$fail"
-  [ "$removed" -gt 0 ]
+  [ "$removed" -gt 0 ] || [ "$fixed" -gt 0 ]
 }
 
 # Перезаписать src/gz entware (+keendev) в conf.
@@ -6160,10 +6284,17 @@ service_opkg_fix() {
       ;;
   esac
 
+  # Доп. репо (github.io и т.п.) проверяем ДО opkg update — иначе wget висит минутами
+  echo
+  info "Проверка доп. репозиториев…"
+  if _opkg_heal_extra_repos; then
+    info "Мёртвые доп. репо отключены."
+  fi
+
   echo
   info "opkg update ($ok_base)…"
   opkg_kill_others
-  if _opkg_do_update; then
+  if _opkg_do_update 90; then
     if [ "$conf_matches" = "1" ]; then
       info "OPKG в порядке."
     else
@@ -6173,12 +6304,12 @@ service_opkg_fix() {
     return 0
   fi
 
-  # Упало из‑за доп. репо (/opt/etc/opkg/*.conf), а не entware — не откатываем основной conf
+  # Упало / timeout — ещё раз heal и повтор (не откатываем основной conf)
   warn "opkg update с ошибками — проверяем доп. репозитории…"
   if _opkg_heal_extra_repos; then
     info "Повтор opkg update…"
     opkg_kill_others
-    if _opkg_do_update; then
+    if _opkg_do_update 90; then
       info "OPKG исправлен ($ok_base)."
       _opkg_tmp_cleanup
       return 0
