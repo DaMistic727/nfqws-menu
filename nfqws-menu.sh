@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.10.12"
+SCRIPT_VERSION="0.10.14"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -5295,12 +5295,12 @@ _opkg_http_get() {
       --retry 0 -o "$dest" "$url" 2>/dev/null &
     pid=$!
   elif [ -n "$wget_bin" ]; then
-    # GNU wget-ssl: -T ok; busybox symlink: -T → segfault → только -O
+    # GNU wget-ssl: -4 (IPv4) + -T; busybox: без -T/-4 (segfault / нет флага)
     # shellcheck disable=SC2086
     if _opkg_wget_is_busybox "$wget_bin"; then
       $wget_bin -O "$dest" "$url" 2>/dev/null &
     else
-      $wget_bin -q -T "$maxt" -O "$dest" "$url" 2>/dev/null &
+      $wget_bin -q -4 -T "$maxt" -O "$dest" "$url" 2>/dev/null &
     fi
     pid=$!
   else
@@ -5830,7 +5830,6 @@ _opkg_prepare_env() {
     case "$t" in
       *busybox*|busybox) ;;
       *)
-        # временно прячем busybox wget из PATH-приоритета
         if [ -L /opt/usr/bin/wget ]; then
           rt=$(readlink /opt/usr/bin/wget 2>/dev/null || true)
           case "$rt" in
@@ -5846,15 +5845,26 @@ _opkg_prepare_env() {
         ;;
     esac
   fi
+  # opkg→wget часто висит на AAAA (github.io). IPv4-only для GNU wget.
+  if [ -x /opt/bin/wget ] || [ -x /opt/libexec/wget-ssl ]; then
+    if [ ! -f /opt/etc/wgetrc ] || ! grep -q 'prefer-family' /opt/etc/wgetrc 2>/dev/null; then
+      mkdir -p /opt/etc
+      {
+        echo "prefer-family = IPv4"
+        echo "timeout = 20"
+      } >> /opt/etc/wgetrc 2>/dev/null || true
+    fi
+  fi
 }
 
 # opkg update с жёстким лимитом (сек). Без него зависает на github.io / DPI.
-# $1 = max секунд (по умолчанию 90). 0 = успех; 124 = timeout; иначе код opkg.
+# $1 = max секунд (по умолчанию 60). 0 = успех; 124 = timeout; иначе код opkg.
 _opkg_do_update() {
-  local maxt="${1:-90}" log="/tmp/opkg-upd-$$.log" rc=0 pid i=0
-  case "$maxt" in ''|*[!0-9]*) maxt=90 ;; esac
+  local maxt="${1:-60}" log="/tmp/opkg-upd-$$.log" rc=0 pid i=0 c
+  case "$maxt" in ''|*[!0-9]*) maxt=60 ;; esac
   [ "$maxt" -lt 15 ] && maxt=15
   _opkg_prepare_env
+  opkg_kill_others 2>/dev/null || true
   rm -f "$log"
   : > "$log"
   opkg update >>"$log" 2>&1 &
@@ -5870,6 +5880,10 @@ _opkg_do_update() {
   done
   if kill -0 "$pid" 2>/dev/null; then
     warn "opkg update: таймаут ${maxt}с — обрыв (часто nfqws.github.io / DPI)."
+    # дети wget opkg
+    for c in $(pgrep -P "$pid" 2>/dev/null || true); do
+      kill -9 "$c" 2>/dev/null || true
+    done
     kill -9 "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     opkg_kill_others 2>/dev/null || true
@@ -5884,6 +5898,76 @@ _opkg_do_update() {
     warn "Частая причина: busybox wget вместо wget-ssl."
   fi
   return "$rc"
+}
+
+# Подобрать URL зеркала sw.ext.io для name/url (пусто = не nfqws*).
+_opkg_sw_mirror_for() {
+  local name="$1" url="$2" sw
+  sw=$(_opkg_github_io_to_sw "$url" 2>/dev/null || true)
+  if [ -z "$sw" ]; then
+    case "$name" in
+      nfqws2-keenetic|nfqws2) sw=$(_opkg_nfqws_sw_base nfqws2 "${ARCH:-all}") ;;
+      nfqws-keenetic-web|nfqws-web) sw=$(_opkg_nfqws_sw_base web all) ;;
+      nfqws-keenetic|nfqws) sw=$(_opkg_nfqws_sw_base nfqws "${ARCH:-all}") ;;
+    esac
+  fi
+  # уже на sw — HTTP-вариант
+  case "$url" in
+    https://sw.ext.io/nfqws*) sw=$(printf '%s\n' "$url" | sed 's|^https://|http://|') ;;
+  esac
+  [ -n "$sw" ] && [ "$sw" != "$url" ] && printf '%s\n' "$sw"
+}
+
+# Probe sw (https, затем http) и переписать conf. 0 = ок.
+_opkg_apply_sw_mirror() {
+  local f="$1" name="$2" sw="$3" sw_http
+  [ -n "$sw" ] || return 1
+  printf '    зеркало … '
+  if _opkg_repo_reachable "$sw" 2 8; then
+    _opkg_print_probe 1 200
+    printf ' → %s\n' "$sw"
+    _opkg_rewrite_repo_url "$f" "$name" "$sw"
+    return 0
+  fi
+  sw_http=$(printf '%s\n' "$sw" | sed 's|^https://|http://|')
+  if [ "$sw_http" != "$sw" ]; then
+    printf 'нет\n    зеркало HTTP … '
+    if _opkg_repo_reachable "$sw_http" 2 8; then
+      _opkg_print_probe 1 200
+      printf ' → %s\n' "$sw_http"
+      _opkg_rewrite_repo_url "$f" "$name" "$sw_http"
+      return 0
+    fi
+  fi
+  _opkg_print_probe 0 200
+  printf '\n'
+  return 1
+}
+
+# После hang opkg: github.io в conf → sw (probe мог быть ok).
+_opkg_force_nfqws_sw_on_hang() {
+  local f line name url sw n=0 log="/tmp/opkg-upd-last.log"
+  if [ -f "$log" ]; then
+    grep -qE 'github\.io|timeout after' "$log" 2>/dev/null || return 1
+  else
+    return 1
+  fi
+  for f in /opt/etc/opkg/*.conf; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        src/gz\ *)
+          name=$(printf '%s\n' "$line" | awk '{print $2}')
+          url=$(printf '%s\n' "$line" | awk '{print $3}')
+          case "$url" in *nfqws.github.io*|*github.io/nfqws*) ;; *) continue ;; esac
+          sw=$(_opkg_sw_mirror_for "$name" "$url") || continue
+          printf '  %s (hang) …\n' "$name"
+          _opkg_apply_sw_mirror "$f" "$name" "$sw" && n=$((n + 1))
+          ;;
+      esac
+    done < "$f"
+  done
+  [ "$n" -gt 0 ]
 }
 
 # Packages.gz доступен? $1=base_url (без /Packages.gz)
@@ -6000,18 +6084,17 @@ _opkg_rewrite_repo_url() {
   fi
 }
 
-# Доп. репо: сначала проверка текущего URL (с выводом),
-# при неудаче — зеркало sw.ext.io (только nfqws*), иначе спросить отключить.
+# Доп. репо: probe URL → при fail зеркало sw (nfqws*) → иначе спросить отключить.
 _opkg_heal_extra_repos() {
   local f line name url fail="/tmp/opkg-fail-$$.txt" nfail=0 removed=0 fixed=0 ncheck=0
-  local dir="/opt/etc/opkg" log="/tmp/opkg-upd-last.log" sw_url sw_http
+  local dir="/opt/etc/opkg" log="/tmp/opkg-upd-last.log" sw
 
   _opkg_dedupe_entware || true
 
   if [ -f "$log" ] && grep -q 'wget returned 255' "$log" 2>/dev/null; then
     if grep -qE 'Failed to download.*(entware|bin\.entware|sw\.ext\.io/entware)' "$log" 2>/dev/null; then
       error "opkg/wget не качает даже основной feed (wget returned 255)."
-      warn "Это не «мёртвые репо» — сначала wget-ssl / PATH (/opt/bin раньше busybox)."
+      warn "Сначала wget-ssl / PATH=/opt/bin:\$PATH"
       return 1
     fi
   fi
@@ -6030,7 +6113,6 @@ _opkg_heal_extra_repos() {
           case "$name" in entware|keendev) continue ;; esac
 
           ncheck=$((ncheck + 1))
-          # короткие timeout: github.io не должен блокировать меню
           printf '  %s\n' "$name"
           printf '    %s … ' "$url"
           if _opkg_repo_reachable "$url" 2 8; then
@@ -6041,61 +6123,11 @@ _opkg_heal_extra_repos() {
           _opkg_print_probe 0 200
           printf '\n'
 
-          # неудача → для nfqws* / github.io пробуем sw.ext.io
-          sw_url=$(_opkg_github_io_to_sw "$url" 2>/dev/null || true)
-          if [ -z "$sw_url" ]; then
-            case "$name" in
-              nfqws2-keenetic|nfqws2) sw_url=$(_opkg_nfqws_sw_base nfqws2 "${ARCH:-all}") ;;
-              nfqws-keenetic-web|nfqws-web) sw_url=$(_opkg_nfqws_sw_base web all) ;;
-              nfqws-keenetic|nfqws) sw_url=$(_opkg_nfqws_sw_base nfqws "${ARCH:-all}") ;;
-            esac
+          sw=$(_opkg_sw_mirror_for "$name" "$url") || sw=""
+          if [ -n "$sw" ] && _opkg_apply_sw_mirror "$f" "$name" "$sw"; then
+            fixed=$((fixed + 1))
+            continue
           fi
-          # уже на sw — HTTP fallback
-          case "$url" in
-            *sw.ext.io/nfqws*)
-              sw_http=$(printf '%s\n' "$url" | sed 's|^https://|http://|')
-              if [ "$sw_http" != "$url" ]; then
-                printf '    зеркало HTTP … '
-                if _opkg_repo_reachable "$sw_http" 2 8; then
-                  _opkg_print_probe 1 200
-                  printf ' → %s\n' "$sw_http"
-                  _opkg_rewrite_repo_url "$f" "$name" "$sw_http"
-                  fixed=$((fixed + 1))
-                  continue
-                fi
-                _opkg_print_probe 0 200
-                printf '\n'
-              fi
-              printf '%s|%s|%s\n' "$f" "$name" "$url" >> "$fail"
-              nfail=$((nfail + 1))
-              continue
-              ;;
-          esac
-
-          if [ -n "$sw_url" ] && [ "$sw_url" != "$url" ]; then
-            printf '    зеркало sw.ext.io … '
-            if _opkg_repo_reachable "$sw_url" 2 8; then
-              _opkg_print_probe 1 200
-              printf ' → %s\n' "$sw_url"
-              _opkg_rewrite_repo_url "$f" "$name" "$sw_url"
-              fixed=$((fixed + 1))
-              continue
-            fi
-            sw_http=$(printf '%s\n' "$sw_url" | sed 's|^https://|http://|')
-            if [ "$sw_http" != "$sw_url" ]; then
-              printf 'нет\n    зеркало HTTP … '
-              if _opkg_repo_reachable "$sw_http" 2 8; then
-                _opkg_print_probe 1 200
-                printf ' → %s\n' "$sw_http"
-                _opkg_rewrite_repo_url "$f" "$name" "$sw_http"
-                fixed=$((fixed + 1))
-                continue
-              fi
-            fi
-            _opkg_print_probe 0 200
-            printf '\n'
-          fi
-
           printf '%s|%s|%s\n' "$f" "$name" "$url" >> "$fail"
           nfail=$((nfail + 1))
           ;;
@@ -6104,21 +6136,20 @@ _opkg_heal_extra_repos() {
   done
 
   if [ "$ncheck" -eq 0 ]; then
-    info "  (доп. репозиториев в /opt/etc/opkg/ нет)"
+    info "  (доп. репозиториев нет)"
     rm -f "$fail"
     return 1
   fi
-
   if [ "$nfail" -eq 0 ]; then
     rm -f "$fail"
-    [ "$fixed" -gt 0 ] && return 0
-    return 1
+    [ "$fixed" -gt 0 ]
+    return $?
   fi
 
   echo
-  printf '%s%s%s\n' "$RED" "Не прошли проверку следующие репозитории:" "$NC"
+  printf '%s%s%s\n' "$RED" "Не прошли проверку:" "$NC"
   while IFS='|' read -r f name url; do
-    printf '  %s%s%s\n' "$RED" "$name — $url" "$NC"
+    printf '  %s%s — %s%s\n' "$RED" "$name" "$url" "$NC"
   done < "$fail"
   echo
 
@@ -6171,7 +6202,7 @@ _opkg_rewrite_conf() {
 service_opkg_fix() {
   local conf="/opt/etc/opkg.conf"
   local arch_path="" has_keendev=0 ok_base="" cur_base="" conf_matches=0
-  local pkg_url kd_url line url name bak need_ca need_wssl
+  local pkg_url line url name bak need_ca need_wssl upd_rc=1
 
   echo
   info "$LBL_S3"
@@ -6184,13 +6215,9 @@ service_opkg_fix() {
     return 1
   fi
 
-  # Дубли entware/keendev в /opt/etc/opkg/*.conf → Duplicate src / segfault risk
   _opkg_dedupe_entware 2>/dev/null || true
-
-  # Битый status (NUL) → opkg list/update segfault
   _opkg_repair_status 2>/dev/null || true
 
-  # Один проход: показать src/gz, arch_path, cur_base, has_keendev
   echo
   info "Текущие репозитории:"
   while IFS= read -r line || [ -n "$line" ]; do
@@ -6200,14 +6227,12 @@ service_opkg_fix() {
         name=$(printf '%s\n' "$line" | awk '{print $2}')
         url=$(printf '%s\n' "$line" | awk '{print $3}')
         [ -n "$url" ] || continue
-        # arch только из валидного сегмента (не «entware»)
         if ! _opkg_arch_path_ok "$arch_path"; then
           arch_path=$(_opkg_arch_path_from_url "$url")
         fi
         case "$name" in
           keendev)
             has_keendev=1
-            # keendev часто …/aarch64-k3.10/keenetic — надёжный источник arch
             if ! _opkg_arch_path_ok "$arch_path"; then
               arch_path=$(_opkg_arch_path_from_url "$url")
             fi
@@ -6227,36 +6252,31 @@ service_opkg_fix() {
     arch_path=$(_opkg_arch_path_fallback)
   fi
   if ! _opkg_arch_path_ok "$arch_path"; then
-    error "Не удалось определить arch-путь (сейчас: «${arch_path:-пусто}»). Проверьте src/gz в $conf"
+    error "Не удалось определить arch-путь (сейчас: «${arch_path:-пусто}»)."
     return 1
   fi
   info "Arch-path: $arch_path"
 
   echo
-  # Нет HTTPS: сначала wget-ssl+ca-certificates по HTTP с sw.ext.io, потом обычный probe
   if ! _opkg_has_https; then
-    warn "Нет HTTPS-клиента (curl / wget-ssl) — пробуем поставить по HTTP…"
+    warn "Нет HTTPS (curl / wget-ssl) — bootstrap по HTTP…"
     if _opkg_bootstrap_ssl_via_http "$arch_path"; then
-      info "Дальше доступны https:// зеркала."
+      info "HTTPS-клиент готов."
     else
-      warn "Bootstrap не удался. Зеркала https:// будут пропущены."
-      warn "Останется только http:// (часто мёртв)."
+      warn "Bootstrap не удался — только http:// зеркала."
     fi
     echo
   fi
 
-  info "Проверка Packages.gz…"
-
-  # 1) текущий — жёсткий короткий timeout (DNS/DPI на bin.entware.net часто «висит»)
+  info "Проверка Packages.gz (entware)…"
   if [ -n "$cur_base" ]; then
     pkg_url="${cur_base}/${arch_path}/Packages.gz"
     printf '  [текущий] %s … ' "$pkg_url"
-    # max=5s connect=2s — не держать меню
-    if _opkg_repo_probe "$pkg_url" "$OPKG_MIN_MAIN" 5 2; then
+    if _opkg_repo_probe "$pkg_url" "$OPKG_MIN_MAIN" 8 3; then
       _opkg_print_probe 1 "$OPKG_MIN_MAIN"
       if [ "$has_keendev" = "1" ]; then
         printf ' + keendev … '
-        if _opkg_repo_probe "${cur_base}/${arch_path}/keenetic/Packages.gz" "$OPKG_MIN_KD" 4 2; then
+        if _opkg_repo_probe "${cur_base}/${arch_path}/keenetic/Packages.gz" "$OPKG_MIN_KD" 6 3; then
           _opkg_print_probe 1 "$OPKG_MIN_KD"
           printf '\n'
           ok_base="$cur_base"
@@ -6274,20 +6294,17 @@ service_opkg_fix() {
     fi
   fi
 
-  # 2) параллельные зеркала (без $(…) — subshell ждёт фоновые curl)
   if [ -z "$ok_base" ]; then
     info "Параллельный подбор зеркала…"
     OPKG_PROBE_WINNER=""
     _opkg_probe_mirrors_parallel "$arch_path" "$has_keendev" "$cur_base" || true
     ok_base="$OPKG_PROBE_WINNER"
   fi
-
   if [ -z "$ok_base" ]; then
     error "Ни один репозиторий не ответил."
     return 1
   fi
 
-  # conf уже на ok_base?
   if grep -qE "^[[:space:]]*src/gz[[:space:]]+entware[[:space:]]+${ok_base}/${arch_path}[[:space:]]*$" "$conf" 2>/dev/null; then
     if [ "$has_keendev" != "1" ] || \
        grep -qE "^[[:space:]]*src/gz[[:space:]]+keendev[[:space:]]+${ok_base}/${arch_path}/keenetic[[:space:]]*$" "$conf" 2>/dev/null; then
@@ -6295,7 +6312,6 @@ service_opkg_fix() {
     fi
   fi
 
-  # Сначала conf → рабочее зеркало (иначе opkg/bootstrap тянет с мёртвого HTTP).
   bak=""
   if [ "$conf_matches" != "1" ]; then
     bak="${conf}.bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)"
@@ -6304,82 +6320,62 @@ service_opkg_fix() {
       error "Не удалось записать $conf"
       return 1
     fi
-    echo
-    info "Записано:"
-    printf '  src/gz entware %s/%s\n' "$ok_base" "$arch_path"
-    [ "$has_keendev" = "1" ] && printf '  src/gz keendev %s/%s/keenetic\n' "$ok_base" "$arch_path"
+    info "Записано: entware $ok_base/$arch_path"
+    [ "$has_keendev" = "1" ] && info "         keendev $ok_base/$arch_path/keenetic"
   fi
 
-  # HTTPS: ca-certificates + wget-ssl (после смены conf)
   case "$ok_base" in
     https://*)
-      refresh_opkg_cache 2>/dev/null || true
       need_ca=1; need_wssl=1
       is_installed "ca-certificates" && need_ca=0
       is_installed "wget-ssl" && need_wssl=0
       if [ "$need_ca" = "1" ] || [ "$need_wssl" = "1" ]; then
-        echo
-        info "HTTPS: ставим ca-certificates / wget-ssl…"
+        info "HTTPS: ca-certificates / wget-ssl…"
         _opkg_bootstrap_https_deps "$ok_base" "$arch_path" || true
-        refresh_opkg_cache 2>/dev/null || true
         if ! is_installed "ca-certificates" || ! is_installed "wget-ssl"; then
-          warn "ca-certificates / wget-ssl не установлены — opkg update по HTTPS может упасть."
+          warn "ca-certificates / wget-ssl не установлены — HTTPS может упасть."
         fi
       fi
       if is_installed "wget-nossl"; then
-        info "Удаляем wget-nossl…"
         opkg remove wget-nossl 2>/dev/null || true
-        refresh_opkg_cache 2>/dev/null || true
       fi
       ;;
   esac
 
-  # Доп. репо (github.io и т.п.) проверяем ДО opkg update — иначе wget висит минутами
   echo
   info "Проверка доп. репозиториев…"
-  if _opkg_heal_extra_repos; then
-    info "Доп. репо обновлены (sw.ext.io / отключены мёртвые)."
-  fi
+  _opkg_heal_extra_repos && info "Доп. репо обновлены." || true
 
   echo
   info "opkg update ($ok_base)…"
-  opkg_kill_others
-  # ещё раз снять lock — после ^C часто остаётся
-  rm -f /opt/tmp/opkg.lock /var/lock/opkg.lock 2>/dev/null || true
-  if _opkg_do_update 90; then
-    if [ "$conf_matches" = "1" ]; then
-      info "OPKG в порядке."
-    else
-      info "OPKG исправлен ($ok_base)."
-    fi
+  if _opkg_do_update 60; then
+    [ "$conf_matches" = "1" ] && info "OPKG в порядке." || info "OPKG исправлен ($ok_base)."
     _opkg_tmp_cleanup
     return 0
   fi
 
-  # Упало / timeout — ещё раз heal и повтор (не откатываем основной conf)
-  warn "opkg update с ошибками — проверяем доп. репозитории…"
-  if _opkg_heal_extra_repos; then
-    info "Повтор opkg update…"
-    opkg_kill_others
-    if _opkg_do_update 90; then
-      info "OPKG исправлен ($ok_base)."
-      _opkg_tmp_cleanup
-      return 0
-    fi
+  # hang: probe github.io ok, но opkg висит → sw; повтор heal + update
+  warn "opkg update не завершился — чиним доп. репо…"
+  _opkg_force_nfqws_sw_on_hang && info "nfqws* → sw.ext.io (после hang)." || true
+  _opkg_heal_extra_repos || true
+  info "Повтор opkg update…"
+  if _opkg_do_update 60; then
+    info "OPKG исправлен ($ok_base)."
+    _opkg_tmp_cleanup
+    return 0
   fi
 
-  # Основной индекс entware уже мог обновиться — не откатываем рабочее зеркало
   if [ -s /opt/var/opkg-lists/entware ]; then
-    warn "Основной entware обновлён, но часть доп. репо всё ещё с ошибками."
-    info "OPKG частично исправлен ($ok_base) — conf не откатываем."
+    warn "entware обновлён, доп. репо с ошибками."
+    info "OPKG частично исправлен ($ok_base)."
     _opkg_tmp_cleanup
     return 0
   fi
 
   if [ "$conf_matches" = "1" ]; then
-    warn "Источник отвечает (curl), но opkg update упал."
+    warn "Источник отвечает, но opkg update упал."
   else
-    error "opkg update не удался после смены источника."
+    error "opkg update не удался."
     [ -n "$bak" ] && [ -f "$bak" ] && { warn "Откат: $bak"; cp "$bak" "$conf" 2>/dev/null || true; }
   fi
   _opkg_tmp_cleanup
