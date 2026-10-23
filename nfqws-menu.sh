@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.10.10"
+SCRIPT_VERSION="0.10.12"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -696,9 +696,12 @@ run_menu_remote_sh() {
 # Снять чужой opkg + stale lock (иначе: Could not lock /opt/tmp/opkg.lock).
 opkg_kill_others() {
   local lock="/opt/tmp/opkg.lock" pids="" p
-  # все процессы opkg (не только -x: busybox pgrep)
   pids=$(pgrep -x opkg 2>/dev/null || true)
   for p in $(pgrep -f '[ /]opkg( |$)' 2>/dev/null || true); do
+    case " $pids " in *" $p "*) ;; *) pids="$pids $p" ;; esac
+  done
+  # фоновые wget/curl от зависшего probe (часто после ^C)
+  for p in $(pgrep -f 'wget.*(Packages\.gz|entware|github\.io|sw\.ext\.io)' 2>/dev/null || true); do
     case " $pids " in *" $p "*) ;; *) pids="$pids $p" ;; esac
   done
   pids=$(printf '%s\n' $pids | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
@@ -710,9 +713,10 @@ opkg_kill_others() {
     # shellcheck disable=SC2086
     kill -9 $pids 2>/dev/null || true
   fi
-  rm -f "$lock" /opt/tmp/opkg.lock /var/lock/opkg.lock 2>/dev/null || true
-  # busybox: lock мог остаться symlink/dir
+  rm -f "$lock" /opt/tmp/opkg.lock /var/lock/opkg.lock /opt/var/lock/opkg.lock 2>/dev/null || true
   [ -e "$lock" ] && rm -rf "$lock" 2>/dev/null || true
+  # на всякий случай после ^C
+  rm -f /opt/tmp/opkg.lock /tmp/opkg.lock 2>/dev/null || true
 }
 
 # Записать opkg-репозиторий и обновить индекс
@@ -5883,16 +5887,20 @@ _opkg_do_update() {
 }
 
 # Packages.gz доступен? $1=base_url (без /Packages.gz)
+# $2=connect $3=max — короткие для доп.репо (github.io не должен висеть).
+# OPKG_PROBE_SZ — размер ответа (для вывода).
 _opkg_repo_reachable() {
-  local base="$1" tmp="/tmp/opkg-reach-$$.gz" sz=0
+  local base="$1" conn="${2:-3}" maxt="${3:-12}" tmp="/tmp/opkg-reach-$$.gz" sz=0
+  OPKG_PROBE_SZ=0
   rm -f "$tmp"
-  if ! _opkg_http_get "${base}/Packages.gz" "$tmp" 3 12; then
+  if ! _opkg_http_get "${base}/Packages.gz" "$tmp" "$conn" "$maxt"; then
     rm -f "$tmp"
     return 1
   fi
   sz=$(wc -c < "$tmp" 2>/dev/null | tr -d ' \n')
   rm -f "$tmp"
   case "$sz" in ''|*[!0-9]*) return 1 ;; esac
+  OPKG_PROBE_SZ=$sz
   [ "$sz" -gt 200 ]
 }
 
@@ -5992,9 +6000,10 @@ _opkg_rewrite_repo_url() {
   fi
 }
 
-# Доп. репо: github.io → sw.ext.io; иначе список мёртвых → отключить.
+# Доп. репо: сначала проверка текущего URL (с выводом),
+# при неудаче — зеркало sw.ext.io (только nfqws*), иначе спросить отключить.
 _opkg_heal_extra_repos() {
-  local f line name url fail="/tmp/opkg-fail-$$.txt" nfail=0 removed=0 fixed=0
+  local f line name url fail="/tmp/opkg-fail-$$.txt" nfail=0 removed=0 fixed=0 ncheck=0
   local dir="/opt/etc/opkg" log="/tmp/opkg-upd-last.log" sw_url sw_http
 
   _opkg_dedupe_entware || true
@@ -6019,10 +6028,20 @@ _opkg_heal_extra_repos() {
           url=$(printf '%s\n' "$line" | awk '{print $3}')
           [ -n "$url" ] || continue
           case "$name" in entware|keendev) continue ;; esac
-          if _opkg_repo_reachable "$url"; then
+
+          ncheck=$((ncheck + 1))
+          # короткие timeout: github.io не должен блокировать меню
+          printf '  %s\n' "$name"
+          printf '    %s … ' "$url"
+          if _opkg_repo_reachable "$url" 2 8; then
+            _opkg_print_probe 1 200
+            printf '\n'
             continue
           fi
-          # github.io / старый URL → зеркало sw.ext.io
+          _opkg_print_probe 0 200
+          printf '\n'
+
+          # неудача → для nfqws* / github.io пробуем sw.ext.io
           sw_url=$(_opkg_github_io_to_sw "$url" 2>/dev/null || true)
           if [ -z "$sw_url" ]; then
             case "$name" in
@@ -6031,33 +6050,64 @@ _opkg_heal_extra_repos() {
               nfqws-keenetic|nfqws) sw_url=$(_opkg_nfqws_sw_base nfqws "${ARCH:-all}") ;;
             esac
           fi
+          # уже на sw — HTTP fallback
+          case "$url" in
+            *sw.ext.io/nfqws*)
+              sw_http=$(printf '%s\n' "$url" | sed 's|^https://|http://|')
+              if [ "$sw_http" != "$url" ]; then
+                printf '    зеркало HTTP … '
+                if _opkg_repo_reachable "$sw_http" 2 8; then
+                  _opkg_print_probe 1 200
+                  printf ' → %s\n' "$sw_http"
+                  _opkg_rewrite_repo_url "$f" "$name" "$sw_http"
+                  fixed=$((fixed + 1))
+                  continue
+                fi
+                _opkg_print_probe 0 200
+                printf '\n'
+              fi
+              printf '%s|%s|%s\n' "$f" "$name" "$url" >> "$fail"
+              nfail=$((nfail + 1))
+              continue
+              ;;
+          esac
+
           if [ -n "$sw_url" ] && [ "$sw_url" != "$url" ]; then
-            printf '  %s … нет → sw.ext.io … ' "$name"
-            if _opkg_repo_reachable "$sw_url"; then
+            printf '    зеркало sw.ext.io … '
+            if _opkg_repo_reachable "$sw_url" 2 8; then
               _opkg_print_probe 1 200
               printf ' → %s\n' "$sw_url"
               _opkg_rewrite_repo_url "$f" "$name" "$sw_url"
               fixed=$((fixed + 1))
               continue
             fi
-            # HTTP fallback (DPI на HTTPS)
             sw_http=$(printf '%s\n' "$sw_url" | sed 's|^https://|http://|')
-            if [ "$sw_http" != "$sw_url" ] && _opkg_repo_reachable "$sw_http"; then
-              _opkg_print_probe 1 200
-              printf ' → %s\n' "$sw_http"
-              _opkg_rewrite_repo_url "$f" "$name" "$sw_http"
-              fixed=$((fixed + 1))
-              continue
+            if [ "$sw_http" != "$sw_url" ]; then
+              printf 'нет\n    зеркало HTTP … '
+              if _opkg_repo_reachable "$sw_http" 2 8; then
+                _opkg_print_probe 1 200
+                printf ' → %s\n' "$sw_http"
+                _opkg_rewrite_repo_url "$f" "$name" "$sw_http"
+                fixed=$((fixed + 1))
+                continue
+              fi
             fi
             _opkg_print_probe 0 200
             printf '\n'
           fi
+
           printf '%s|%s|%s\n' "$f" "$name" "$url" >> "$fail"
           nfail=$((nfail + 1))
           ;;
       esac
     done < "$f"
   done
+
+  if [ "$ncheck" -eq 0 ]; then
+    info "  (доп. репозиториев в /opt/etc/opkg/ нет)"
+    rm -f "$fail"
+    return 1
+  fi
 
   if [ "$nfail" -eq 0 ]; then
     rm -f "$fail"
@@ -6288,12 +6338,14 @@ service_opkg_fix() {
   echo
   info "Проверка доп. репозиториев…"
   if _opkg_heal_extra_repos; then
-    info "Мёртвые доп. репо отключены."
+    info "Доп. репо обновлены (sw.ext.io / отключены мёртвые)."
   fi
 
   echo
   info "opkg update ($ok_base)…"
   opkg_kill_others
+  # ещё раз снять lock — после ^C часто остаётся
+  rm -f /opt/tmp/opkg.lock /var/lock/opkg.lock 2>/dev/null || true
   if _opkg_do_update 90; then
     if [ "$conf_matches" = "1" ]; then
       info "OPKG в порядке."
