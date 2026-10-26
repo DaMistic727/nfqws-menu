@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.10.15"
+SCRIPT_VERSION="0.10.16"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -2062,8 +2062,9 @@ extract_list_paths() {
 
 # Универсальная проверка отсутствующих файлов из конфига
 # $1=label $2=conf $3=extractor_func $4=repo_subdir $5=ask_msg
+# $6=auto — без confirm, сразу скачать отсутствующие
 check_conf_files() {
-  local label="$1" conf="$2" extractor="$3" repo_sub="$4" ask_msg="$5"
+  local label="$1" conf="$2" extractor="$3" repo_sub="$4" ask_msg="$5" auto="${6:-0}"
   local paths path name missing=0 missing_list=""
 
   if [ ! -f "$conf" ]; then
@@ -2091,7 +2092,11 @@ check_conf_files() {
   [ "$missing" -eq 0 ] && { info "Все используемые $label на месте."; return 0; }
 
   warn "Часть $label отсутствует."
-  confirm_yes "$ask_msg" || return 0
+  if [ "$auto" != "1" ]; then
+    confirm_yes "$ask_msg" || return 0
+  else
+    info "Скачивание отсутствующих $label..."
+  fi
 
   for path in $missing_list; do
     name=$(basename "$path")
@@ -2204,21 +2209,46 @@ check_blobs() {
   done
 }
 
-check_lists() { check_conf_files "lists" "$2" extract_list_paths "lists" "Скачать отсутствующие lists из strategies/lists/?"; }
+# $3=1 — сразу скачать отсутствующие без вопроса
+check_lists() { check_conf_files "lists" "$2" extract_list_paths "lists" "Скачать отсутствующие lists из strategies/lists/?" "${3:-0}"; }
 
+# Обновить все .list, на которые ссылается конфиг (пути из extract_list_paths).
+# $1=ver  $2=conf
+# auto.list не качается из репозитория (заполняется демоном) — только touch при отсутствии.
 update_lists() {
-  local ver="$1" dest_dir name
+  local ver="$1" conf="$2" paths path name dest_dir count=0
   dest_dir=$(nfqws_lists_dir "$ver")
   mkdir -p "$dest_dir"
-  for name in user.list exclude.list ipset.list ipset_exclude.list; do
-    info "Обновление $name ..."
-    if download_file "${RAW_BASE}/strategies/lists/${name}" "${dest_dir}/${name}"; then
-      info "  → ${dest_dir}/${name}"
+
+  if [ -n "$conf" ] && [ -f "$conf" ]; then
+    paths=$(extract_list_paths "$conf")
+  fi
+  if [ -z "$paths" ]; then
+    # fallback: стандартный набор, если в конфиге нет явных путей
+    paths=""
+    for name in user.list exclude.list ipset.list ipset_exclude.list; do
+      paths="$paths ${dest_dir}/${name}"
+    done
+    warn "В конфиге нет ссылок на lists — обновляем стандартный набор."
+  fi
+
+  info "Обновление lists из strategies/lists/:"
+  for path in $paths; do
+    name=$(basename "$path")
+    mkdir -p "$(dirname "$path")"
+    if [ "$name" = "auto.list" ]; then
+      [ -f "$path" ] || { touch "$path"; info "  создан пустой $path (auto.list — демон)"; }
+      continue
+    fi
+    info "  $name ..."
+    if download_file "${RAW_BASE}/strategies/lists/${name}" "$path"; then
+      info "    → $path"
+      count=$((count + 1))
     else
-      warn "  не удалось скачать $name (пропуск)"
+      warn "    не удалось скачать $name (пропуск)"
     fi
   done
-  info "Списки обновлены (auto.list не изменялся)."
+  info "Обновлено lists: $count"
 }
 
 # Восстановить строку VAR=… в конфиге (полная строка как была, без CRLF).
@@ -2350,7 +2380,7 @@ apply_strategy() {
   fi
   rm -f "$tmp"
 
-  # POLICY_*: стандарт (nfqws / 0) не трогаем; нестандартные — только по y/N
+  # POLICY_*: стандарт (nfqws / 0) не трогаем; нестандартные — восстановить по Y/n (да по умолчанию)
   if [ "$had_policy" -eq 1 ]; then
     pn_val=$(printf '%s' "${saved_policy_name#POLICY_NAME=}" | tr -d '\r"' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     pe_val=$(printf '%s' "${saved_policy_exclude#POLICY_EXCLUDE=}" | tr -d '\r"' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -2363,7 +2393,7 @@ apply_strategy() {
       info "Сохранённые POLICY_* отличаются от стандартных (nfqws / 0):"
       [ -n "$saved_policy_name" ] && info "  $saved_policy_name"
       [ -n "$saved_policy_exclude" ] && info "  $saved_policy_exclude"
-      if confirm_no "Восстановить эти POLICY_NAME / POLICY_EXCLUDE?"; then
+      if confirm_yes "Восстановить эти POLICY_NAME / POLICY_EXCLUDE?"; then
         [ -n "$saved_policy_name" ] && restore_conf_var_line "$conf_dest" "POLICY_NAME" "$saved_policy_name"
         [ -n "$saved_policy_exclude" ] && restore_conf_var_line "$conf_dest" "POLICY_EXCLUDE" "$saved_policy_exclude"
         info "POLICY_* восстановлены."
@@ -2383,14 +2413,13 @@ apply_strategy() {
   check_blobs "$ver" "$conf_dest"
 
   echo
-  info "=== Проверка lists ==="
-  check_lists "$ver" "$conf_dest"
-
-  echo
-  if confirm_no "Принудительно обновить все lists (user/exclude/ipset) из репозитория?"; then
-    update_lists "$ver"
+  info "=== Lists ==="
+  # Y — все lists из конфига; N — только отсутствующие (без дополнительного вопроса)
+  if confirm_no "Обновить все lists, указанные в конфиге, из репозитория?"; then
+    update_lists "$ver" "$conf_dest"
   else
-    info "Принудительное обновление lists пропущено."
+    info "Полное обновление lists пропущено — скачиваем отсутствующие..."
+    check_lists "$ver" "$conf_dest" 1
   fi
 
   # Восстановить привязку rkn.list в MODE_LIST, если она была до смены стратегии
