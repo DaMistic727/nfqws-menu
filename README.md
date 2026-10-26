@@ -33,20 +33,35 @@
 
 > **Рекомендуется jsDelivr** — `raw.githubusercontent.com` у части провайдеров отвечает **404** (DPI), хотя файл в репозитории есть.
 
-### Установка через jsDelivr (предпочтительно)
+### 1. Установите необходимые зависимости
 
 ```bash
-opkg update && opkg install curl wget-ssl
+opkg update
+opkg install curl wget-ssl ca-certificates
+opkg remove wget-nossl 2>/dev/null || true
+```
+
+- **curl** / **wget-ssl** — загрузки по HTTPS (меню, зеркала, installers)
+- **ca-certificates** — проверка TLS-сертификатов (без него HTTPS часто падает)
+- **wget-nossl** — убрать, если стоит: конфликтует с `wget-ssl`, `opkg` может брать «глухой» wget без SSL
+
+### 2. Установка меню
+
+**Через jsDelivr (предпочтительно):**
+
+```bash
 wget -O /opt/nfqws-menu.sh https://cdn.jsdelivr.net/gh/rndnaame/nfqws-menu@main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
 ```
 
-### Установка с GitHub raw (если не режется)
+**С GitHub raw (если не режется):**
 
 ```bash
 wget -O /opt/nfqws-menu.sh https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
 ```
 
-После первого запуска создаётся symlink для быстрого старта:
+### 3. Быстрый запуск `menu`
+
+После первого запуска создаётся symlink:
 
 ```bash
 menu
