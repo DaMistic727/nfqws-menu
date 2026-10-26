@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.10.17"
+SCRIPT_VERSION="0.10.18"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -4148,6 +4148,13 @@ update_self() {
   unset SCRIPT_PATH
   export SCRIPT_PATH="$dest"
   info "Перезапуск меню..."
+  # Фоновый upd_check_bg шлёт USR1 на MENU_PID. После exec PID тот же,
+  # а trap ещё не стоит → ash печатает «User defined signal 1» и выходит.
+  [ -n "${UPD_JOB:-}" ] && kill "$UPD_JOB" 2>/dev/null || true
+  UPD_JOB=""
+  trap - USR1 HUP TERM EXIT 2>/dev/null || true
+  trap '' USR1
+  rm -f "${MENU_PIDFILE:-/tmp/nfqws-menu.pid}" 2>/dev/null || true
   exec sh "$dest"
 }
 
