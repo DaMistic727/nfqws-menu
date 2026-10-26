@@ -4,7 +4,7 @@
 
 Репозиторий также служит хранилищем готовых **стратегий** обхода DPI, **blobs** и **lists**.
 
-- Скрипт: `nfqws-menu.sh` (текущая версия **0.10.8**)
+- Скрипт: `nfqws-menu.sh` (текущая версия **0.10.15**)
 - Стратегии: `strategies/`
 - Hosts: `hosts`
 - Контрольные суммы: `SHA256SUMS`, `strategies/blobs/SHA256SUMS`
@@ -40,28 +40,10 @@ opkg update && opkg install curl wget-ssl
 wget -O /opt/nfqws-menu.sh https://cdn.jsdelivr.net/gh/rndnaame/nfqws-menu@main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
 ```
 
-или curl:
-
-```bash
-curl -fsSL -o /opt/nfqws-menu.sh https://cdn.jsdelivr.net/gh/rndnaame/nfqws-menu@main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
-```
-
-Запасное зеркало (Fastly):
-
-```bash
-wget -O /opt/nfqws-menu.sh https://fastly.jsdelivr.net/gh/rndnaame/nfqws-menu@main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
-```
-
 ### Установка с GitHub raw (если не режется)
 
 ```bash
 wget -O /opt/nfqws-menu.sh https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
-```
-
-или ghproxy:
-
-```bash
-wget -O /opt/nfqws-menu.sh https://ghproxy.net/https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/nfqws-menu.sh && chmod +x /opt/nfqws-menu.sh && sh /opt/nfqws-menu.sh
 ```
 
 После первого запуска создаётся symlink для быстрого старта:
@@ -99,6 +81,7 @@ menu
       6.  Смена активных fake:blob
       7.  Обновление hosts
       8.  Управление DoT/DoH
+      9.  Discord: все пакеты в nfqws2
 
 [::]  УТИЛИТЫ
       10. dpi-detector
@@ -282,6 +265,30 @@ menu
 > Нужен `ndmc` (CLI Keenetic/Netcraze).\
 > При активном **Интернет-фильтре** часть DoT может помечаться как *disregarded*.
 
+### 9. Discord: все пакеты в nfqws2
+
+Фикс для **Discord voice/UDP** на **nfqws2-keenetic**: по умолчанию nfqws2 обрабатывает только *первые* пакеты соединения; голос Discord часто «отваливается» после установления сессии. Пункт направляет **весь** UDP Discord в nfqws2 на протяжении звонка и исключает эти порты из аппаратного/программного ускорения (PPE).
+
+Требуется установленный **nfqws2-keenetic**. Запускает [`nfqws2_fullsession.sh`](https://github.com/rndnaame/nfqws-menu/blob/main/nfqws2_fullsession.sh) (скачивание с репозитория; при офлайне — локальная копия `/opt/etc/nfqws2-fullsession/`).
+
+Возможности скрипта (меню / CLI):
+
+| Команда / действие | Описание |
+| --- | --- |
+| **меню** (без аргументов) | интерактив: статус, включить, выключить, порты, XKeen |
+| `status` | диагностика: nfqws2, правила, порты, лог |
+| `apply` | включить fullsession (порты по умолчанию `19294:19344,50000:50100`; можно `PORTS=…`) |
+| `remove` | выключить и удалить правила/хуки |
+| `rules` / `unrules` | поставить или снять только netfilter-правила |
+| `xkeen` | исключить порты Discord из списка XKeen (`port_exclude.lst`) |
+
+Что ставится при **apply**:
+
+- конфиг `/opt/etc/nfqws2-fullsession/fullsession.conf` (`PORTS=…`);
+- init `/opt/etc/init.d/S52nfqws2-fullsession`;
+- хук netfilter `/opt/etc/ndm/netfilter.d/101-nfqws2-fullsession.sh` (цепочки mangle, mark `0x40000000`, `-j PPE` bypass);
+- статус в блоке «Установленные компоненты» как **nfqws2-fullsession**.
+
 ### 10. dpi-detector
 
 Инструмент для анализа цензуры трафика в России: обнаруживает и классифицирует блокировки сайтов, хостингов и CDN (TCP16–20 блокировки), а также подмену DNS-запросов провайдером.
@@ -456,12 +463,19 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 
 ## Changelog
 
-### 0.10.7
+### 0.10.15
 
-- Версия скрипта **0.10.7**; README синхронизирован с меню
-- **S → 3. Починить OPKG** — lock/status/`src/gz`/arch-path
-- **п. 16** — установка через `installer_tgws_rs.sh` репозитория
-- **п. 17 firc** — через `installer_firc.sh`
+- **п. 9** — возвращён **Discord: все пакеты в nfqws2** (`nfqws2_fullsession.sh`): пропал в 0.10.7 при выносе п.16 в отдельный installer
+- README: описание п.9; убраны лишние варианты установки меню (Fastly / curl-jsDelivr / ghproxy)
+
+### 0.10.10 – 0.10.14
+
+- **S → 3. Починить OPKG**: зеркала `sw.ext.io/entware` и `sw.ext.io/nfqws{,2,-web}`; probe доп. репо; github.io → sw при fail/hang; IPv4 wget; timeout `opkg update` 60 с; repair status/lock
+
+### 0.10.7 – 0.10.9
+
+- **п. 16** — `installer_tgws_rs.sh`; **п. 17 firc** — `installer_firc.sh`
+- *(в 0.10.7 при upload не попал п.9 Discord — восстановлен в 0.10.15)*
 
 ### 0.10.4
 
