@@ -10,7 +10,7 @@
 
 set -e
 
-SCRIPT_VERSION="0.10.16"
+SCRIPT_VERSION="0.10.17"
 
 REPO_URL="https://github.com/rndnaame/nfqws-menu"
 RAW_BASE="https://raw.githubusercontent.com/rndnaame/nfqws-menu/main"
@@ -730,22 +730,6 @@ ensure_opkg_repo() {
   opkg update
 }
 
-# Установка/обновление opkg-пакета (если установлен — upgrade)
-opkg_install_or_upgrade() {
-  local pkg="$1"
-  if is_installed "$pkg"; then
-    info "Пакет $pkg уже установлен — обновление..."
-    opkg update
-    opkg upgrade "$pkg"
-    info "Обновление завершено."
-  else
-    info "Установка $pkg..."
-    opkg update
-    opkg install "$pkg"
-    info "Установка завершена."
-  fi
-}
-
 # Перезапуск init-скрипта, если есть
 service_restart() {
   local init="$1"
@@ -1031,55 +1015,6 @@ port_is_open() {
     if [ "$ok" -eq 0 ]; then PORT90_CACHE=1; else PORT90_CACHE=0; fi
   fi
   return "$ok"
-}
-
-proc_running() {
-  local name="$1"
-  [ -n "$PROC_CACHE" ] || refresh_proc_cache
-  # substring в кэше ps — без fork (имена сервисов достаточно уникальны)
-  case "$PROC_CACHE" in
-    *"$name"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# Целое имя команды: tg-ws-proxy ≠ tg-ws-proxy-rs
-proc_running_exact() {
-  local name="$1" line
-  [ -n "$PROC_CACHE" ] || refresh_proc_cache
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      *"/$name "*|*"/$name"|*" $name "*|*" $name") return 0 ;;
-    esac
-  done <<EOF
-$PROC_CACHE
-EOF
-  return 1
-}
-
-# kind → «запущен?» (по процессу / порту)
-service_is_up() {
-  case "$1" in
-    nfqws|nfqws2|usque|magitrickle|awg-manager|firc) proc_running "$1" ;;
-    # tg-ws-proxy-rs содержит "tg-ws-proxy" подстрокой, поэтому у Go-сборки
-    # совпадение по целому имени команды, а у Rust — по своей строке.
-    tg-ws-proxy)    proc_running_exact "tg-ws-proxy" ;;
-    tg-ws-proxy-rs) proc_running "tg-ws-proxy-rs" ;;
-    web)
-      port_is_open 90 || proc_running lighttpd
-      ;;
-    # awg-manager: сам демон, либо sing-box из его каталога, либо amneziawg
-    awg)
-      proc_running "awg-manager" && return 0
-      proc_running "amneziawg" && return 0
-      # sing-box часто общий; учитываем только если он из комплекта awg-manager
-      if [ -x /opt/etc/awg-manager/singbox/sing-box ] || [ -f /opt/etc/awg-manager/singbox/sing-box ]; then
-        proc_running "sing-box" && return 0
-      fi
-      return 1
-      ;;
-    *) return 1 ;;
-  esac
 }
 
 # Один awk: OPKG + PROC + UPD → готовые строки статуса (минимум fork на MIPS)
