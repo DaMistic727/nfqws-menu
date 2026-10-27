@@ -1040,8 +1040,8 @@ run_iface_probes() {
   check_url_via_iface "$1" "https://web.telegram.org/" "web.telegram.org" && _probe_ok=$((_probe_ok + 1))
 }
 
-# Список доступных интерфейсов для проверки: opkgtun* nwg* awg*
-list_check_ifaces() {
+# Кандидаты по имени: opkgtun* nwg* awg* (ещё без проверки интернета)
+list_candidate_ifaces() {
   _if_list=""
   for n in /sys/class/net/*; do
     [ -e "$n" ] || continue
@@ -1052,7 +1052,6 @@ list_check_ifaces() {
         ;;
     esac
   done
-  # fallback без /sys
   if [ -z "$(printf '%s' "$_if_list" | tr -d ' ')" ]; then
     if command -v ip >/dev/null 2>&1; then
       for b in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1); do
@@ -1062,8 +1061,124 @@ list_check_ifaces() {
       done
     fi
   fi
-  # uniq + sort
   printf '%s\n' $_if_list | tr ' ' '\n' | grep -v '^$' | sort -u
+}
+
+# Интерфейс UP? (operstate / flags)
+iface_is_up() {
+  ifc="$1"
+  if [ -r "/sys/class/net/$ifc/operstate" ]; then
+    st=$(cat "/sys/class/net/$ifc/operstate" 2>/dev/null)
+    case "$st" in
+      up|unknown) return 0 ;;  # unknown часто у tun
+      *) return 1 ;;
+    esac
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    ip -o link show "$ifc" 2>/dev/null | grep -q ',UP' && return 0
+  fi
+  return 1
+}
+
+# Есть IPv4 на интерфейсе?
+iface_has_ipv4() {
+  ifc="$1"
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show dev "$ifc" 2>/dev/null | grep -q 'inet '
+    return $?
+  fi
+  ifconfig "$ifc" 2>/dev/null | grep -q 'inet addr:\|inet '
+  return $?
+}
+
+# Кэш RCI show/interface (локально, быстро)
+RCI_IFACE_JSON=""
+rci_fetch_interfaces() {
+  if [ -n "$RCI_IFACE_JSON" ]; then
+    return 0
+  fi
+  RCI_IFACE_JSON=""
+  if command -v curl >/dev/null 2>&1; then
+    RCI_IFACE_JSON=$(curl -s --connect-timeout 1 --max-time 2 "http://127.0.0.1:79/rci/show/interface" 2>/dev/null) || RCI_IFACE_JSON=""
+  fi
+  if [ -z "$RCI_IFACE_JSON" ] && command -v wget >/dev/null 2>&1; then
+    RCI_IFACE_JSON=$(wget -qO- -T 2 "http://127.0.0.1:79/rci/show/interface" 2>/dev/null) || RCI_IFACE_JSON=""
+  fi
+  [ -n "$RCI_IFACE_JSON" ]
+}
+
+# RCI id → linux ifname (Keenetic)
+#   Wireguard0 → nwg0
+#   OpkgTun17  → opkgtun17
+#   Wireguard / OpkgTun без изменений регистра индекса
+rci_id_to_linux() {
+  id="$1"
+  case "$id" in
+    Wireguard*|WireGuard*|wireguard*)
+      num=$(printf '%s' "$id" | sed 's/.*[^0-9]//')
+      printf 'nwg%s' "$num"
+      ;;
+    OpkgTun*|opkgtun*|OPKGTUN*)
+      num=$(printf '%s' "$id" | sed 's/.*[^0-9]//')
+      printf 'opkgtun%s' "$num"
+      ;;
+    Awg*|AWG*|awg*)
+      num=$(printf '%s' "$id" | sed 's/.*[^0-9]//')
+      printf 'awg%s' "$num"
+      ;;
+    *)
+      # уже linux-имя?
+      printf '%s' "$id" | tr 'A-Z' 'a-z'
+      ;;
+  esac
+}
+
+# Один проход RCI: linux-имена с "global": true (только true)
+# stdout: nwg0\nnwg1\n...
+list_global_linux_ifaces() {
+  rci_fetch_interfaces || return 1
+  # объекты { ... } → строки; только с global: true; берём "id"
+  printf '%s' "$RCI_IFACE_JSON" | tr '\n' ' ' | tr '{' '\n' | \
+  grep -E '"global"[[:space:]]*:[[:space:]]*true' | while IFS= read -r block || [ -n "$block" ]; do
+    # id первого уровня объекта
+    rid=$(printf '%s' "$block" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$rid" ] || continue
+    # пропускаем вложенные port/id без смысла для vpn
+    case "$rid" in
+      */*) continue ;;  # GigabitEthernet0/0 и т.п.
+    esac
+    linux=$(rci_id_to_linux "$rid")
+    [ -n "$linux" ] || continue
+    printf '%s\n' "$linux"
+  done | sort -u
+}
+
+# Кандидаты: opkgtun*/nwg*/awg* ∩ global:true (быстро, один RCI)
+list_check_ifaces() {
+  rm -f /tmp/usque-if-skip-$$
+  cands=$(list_candidate_ifaces)
+  [ -n "$cands" ] || return 0
+
+  globals=$(list_global_linux_ifaces 2>/dev/null) || globals=""
+  if [ -z "$globals" ]; then
+    if [ -z "$RCI_IFACE_JSON" ]; then
+      warn "RCI show/interface недоступен"
+      printf '%s\n' "$cands" | while IFS= read -r ifc || [ -n "$ifc" ]; do
+        [ -n "$ifc" ] || continue
+        printf 'SKIP %s no-rci\n' "$ifc" >> /tmp/usque-if-skip-$$
+      done
+      return 0
+    fi
+  fi
+
+  printf '%s\n' "$cands" | while IFS= read -r ifc || [ -n "$ifc" ]; do
+    [ -n "$ifc" ] || continue
+    if printf '%s\n' "$globals" | grep -qxF "$ifc"; then
+      printf '%s\n' "$ifc"
+    else
+      printf 'SKIP %s no-global\n' "$ifc" >> /tmp/usque-if-skip-$$
+    fi
+  done
 }
 
 # Выбор интерфейса: 1 шт — без запроса; несколько — меню; 0 — conf / ввод
@@ -1073,26 +1188,41 @@ pick_check_iface() {
   conf_iface=$(get_usque_iface)
   info "IFACE из конфига: ${conf_iface} (${CONF_FILE})"
 
-  avail=$(list_check_ifaces)
-  if [ -n "$conf_iface" ]; then
-    if ip link show "$conf_iface" >/dev/null 2>&1 || [ -e "/sys/class/net/$conf_iface" ]; then
-      if ! printf '%s\n' "$avail" | grep -qxF "$conf_iface"; then
-        avail=$(printf '%s\n%s\n' "$conf_iface" "$avail" | grep -v '^$' | sort -u)
-      fi
-    fi
+  info "Поиск интерфейсов opkgtun*/nwg*/awg* с global: true..."
+  rm -f /tmp/usque-if-skip-$$
+  avail_raw=$(list_check_ifaces)
+  # имя интерфейса — первое поле (второе может быть global/default)
+  avail=$(printf '%s\n' "$avail_raw" | awk '{print $1}' | grep -v '^$' | sort -u)
+  # показать отброшенные
+  if [ -f /tmp/usque-if-skip-$$ ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] || continue
+      sk=$(printf '%s' "$line" | awk '{print $2}')
+      reason=$(printf '%s' "$line" | awk '{print $3}')
+      case "$reason" in
+        down) printf '%s\n' "${DIM}  - $sk (down)${NC}" ;;
+        no-ip) printf '%s\n' "${DIM}  - $sk (нет IPv4)${NC}" ;;
+        no-global) printf '%s\n' "${DIM}  - $sk (global != true)${NC}" ;;
+        no-rci) printf '%s\n' "${DIM}  - $sk (нет RCI)${NC}" ;;
+        *) printf '%s\n' "${DIM}  - $sk ($reason)${NC}" ;;
+      esac
+    done < /tmp/usque-if-skip-$$
+    rm -f /tmp/usque-if-skip-$$
   fi
 
   n=$(printf '%s\n' "$avail" | grep -c . 2>/dev/null || echo 0)
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
 
   if [ "$n" -eq 0 ]; then
-    warn "Не найдено интерфейсов opkgtun*/nwg*/awg*."
+    warn "Нет интерфейсов opkgtun*/nwg*/awg* с global: true."
+    # предложить conf даже если offline — пользователь может хотеть диагностику
     if [ -n "$conf_iface" ]; then
-      info "Берём из конфига: $conf_iface"
-      CHECK_IFACE="$conf_iface"
-      return 0
+      if confirm_yes "Проверить conf IFACE ($conf_iface) всё равно?"; then
+        CHECK_IFACE="$conf_iface"
+        return 0
+      fi
     fi
-    printf '%s' "Введите имя интерфейса: "
+    printf '%s' "Введите имя интерфейса (или Enter = отмена): "
     CHECK_IFACE=$(read_choice)
     echo
     return 0
@@ -1100,7 +1230,7 @@ pick_check_iface() {
 
   if [ "$n" -eq 1 ]; then
     only=$(printf '%s\n' "$avail" | head -1)
-    info "Доступен один интерфейс: $only — проверяем его"
+    info "Один подходящий интерфейс: $only — проверяем его"
     CHECK_IFACE="$only"
     return 0
   fi
