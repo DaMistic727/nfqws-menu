@@ -4,7 +4,7 @@
 
 Репозиторий также служит хранилищем готовых **стратегий** обхода DPI, **blobs** и **lists**.
 
-- Скрипт: `nfqws-menu.sh` (текущая версия **0.10.15**)
+- Скрипт: `nfqws-menu.sh` (текущая версия **0.10.18**)
 - Стратегии: `strategies/`
 - Hosts: `hosts`
 - Контрольные суммы: `SHA256SUMS`, `strategies/blobs/SHA256SUMS`
@@ -184,9 +184,9 @@ menu
 
 ### 3. Обновление IPSet List
 
-Скачивает актуальный IP/CIDR-список из\
+Предлагает выбрать IP/CIDR-список: большой список из\
 [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube)\
-и записывает в `ipset.list`:
+или стандартный список из репозитория соответствующего пакета (`nfqws-keenetic` / `nfqws2-keenetic`). Записывает его в `ipset.list`:
 
 | Версия | Путь |
 | --- | --- |
@@ -290,7 +290,7 @@ menu
 
 | Команда / действие | Описание |
 | --- | --- |
-| **меню** (без аргументов) | интерактив: статус, включить, выключить, порты, XKeen |
+| **меню** (без аргументов) | интерактив: статус, включить, выключить, исключить порты Discord из XKeen (если установлен); отдельной настройки портов нет |
 | `status` | диагностика: nfqws2, правила, порты, лог |
 | `apply` | включить fullsession (порты по умолчанию `19294:19344,50000:50100`; можно `PORTS=…`) |
 | `remove` | выключить и удалить правила/хуки |
@@ -420,7 +420,7 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 
 Проба есть с версии **2.4.5**; у более старого бинаря меню предложит обновиться.
 
-Секрет меню пишет само, до установки: генератор секрета в `install.sh` проекта использует `od -An`, которого BusyBox не знает, и на боксе без готового секрета установка падает. Если секрет остался от Go-версии, переносится он — тогда ссылки клиентов не меняются.
+Если секрет остался от Go-версии, меню переносит его до установки — тогда ссылки клиентов не меняются. При отсутствии готового секрета его создаёт штатный `install.sh` проекта.
 
 ### 17. firc
 
@@ -432,9 +432,11 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_firc.sh | sh
 ```
 
+Пункт **17** запускает удалённый `installer_firc.sh`. В его меню:
+
 1. **Установка / обновление firc** — `src/gz hoaxisr` → `/opt/etc/opkg/awg_manager.conf` ([repo.hoaxisr.ru](https://repo.hoaxisr.ru/)), затем `opkg update && opkg install firc`
-2. **Удаление firc** — `opkg remove` (`awg_manager.conf` не трогаем)
-3. **Полное меню** — remote `installer_firc.sh` (диагностика и т.п.)
+2. **Удаление firc** — `opkg remove` (`awg_manager.conf` не трогает)
+3. **Диагностика**
 
 - Init: `/opt/etc/init.d/S99firc` (start | stop | restart | status)
 - WebUI: обычно порт **666**
@@ -443,7 +445,7 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 
 ### 77. Change language
 
-Мгновенное переключение интерфейса **ru ↔ en** (файл `/opt/etc/nfqws-menu.lang`).
+Мгновенное переключение интерфейса **ru ↔ en** (файл `/opt/etc/nfqws-menu/nfqws-menu.lang`). При первом запуске файл по старому пути `/opt/etc/nfqws-menu.lang` переносится в новый каталог.
 
 ### 88. Удаление пакетов
 
@@ -462,7 +464,7 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 - Пакеты NFQWS — `opkg remove --autoremove`
 - **dpi-detector** — бинарник (`/opt/bin/dpi-detector` и др.)
 - **awg-manager** — `opkg remove` + `rm -rf /opt/etc/awg-manager`
-- **tg-ws-proxy-rs** — бинарь, init, конфиги
+- **tg-ws-proxy-rs** — бинарь и init; конфиг и секрет удаляются по подтверждению
 - **usque-keenetic** — `opkg remove --autoremove` + `/opt/etc/opkg/usque-keenetic.conf`
 - **firc** — `opkg remove --autoremove` (+ stop `S99firc`; `awg_manager.conf` не удаляем)
 - **magitrickle** — `opkg remove` + запрос на удаление `/opt/etc/opkg/magitrickle.conf`
@@ -672,7 +674,7 @@ curl -fsSL https://raw.githubusercontent.com/rndnaame/nfqws-menu/main/installer_
 ```
 nfqws-menu/
 ├── nfqws-menu.sh          # Главный скрипт меню
-├── hosts                  # Секции IP DOMAIN для п. 8 (ndmc ip host)
+├── hosts                  # Секции IP DOMAIN для п. 7 (ndmc ip host)
 ├── SHA256SUMS             # Хеши файлов репозитория (список стратегий без API)
 ├── README.md
 ├── .github/workflows/
@@ -733,7 +735,6 @@ netstat -lnt | grep ':90'
 opkg info nfqws-keenetic
 opkg info nfqws2-keenetic
 opkg info nfqws-keenetic-web
-opkg info tg-ws-proxy-rs   # если установлен как пакет
 opkg info usque-keenetic
 opkg info magitrickle
 

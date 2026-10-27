@@ -2674,7 +2674,7 @@ update_ipset_list() {
   fi
 
   # choice=2 — стандартный ipset из репозитория пакета
-  src_label="nfqws (офиставка пакета)"
+  src_label="из репозитория nfqws-keenetic/nfqws2-keenetic"
   info "Скачивание стандартного IPSet ($src_label) ..."
 
   case "$NFQWS_VER" in
