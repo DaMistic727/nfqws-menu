@@ -1040,32 +1040,160 @@ run_iface_probes() {
   check_url_via_iface "$1" "https://web.telegram.org/" "web.telegram.org" && _probe_ok=$((_probe_ok + 1))
 }
 
-do_check_iface() {
-  echo
-  info "Проверка интерфейса usque"
-  iface=$(get_usque_iface)
-  info "IFACE: $iface (из $CONF_FILE)"
-
-  if ! is_usque_running; then
-    error "Сервис usque не запущен."
-    echo "  Запуск: $INIT_SCRIPT start"
-    if confirm_yes "Запустить сервис сейчас?"; then
-      if [ -x "$INIT_SCRIPT" ]; then
-        "$INIT_SCRIPT" start 2>&1 || true
-      fi
-      if ! is_usque_running; then
-        error "Сервис так и не запустился."
-        return 1
-      fi
-      info "Сервис: запущен"
-    else
-      return 1
+# Список доступных интерфейсов для проверки: opkgtun* nwg* awg*
+list_check_ifaces() {
+  _if_list=""
+  for n in /sys/class/net/*; do
+    [ -e "$n" ] || continue
+    b=$(basename "$n")
+    case "$b" in
+      opkgtun*|nwg*|awg*)
+        _if_list="${_if_list} $b"
+        ;;
+    esac
+  done
+  # fallback без /sys
+  if [ -z "$(printf '%s' "$_if_list" | tr -d ' ')" ]; then
+    if command -v ip >/dev/null 2>&1; then
+      for b in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1); do
+        case "$b" in
+          opkgtun*|nwg*|awg*) _if_list="${_if_list} $b" ;;
+        esac
+      done
     fi
-  else
-    info "Сервис: запущен"
+  fi
+  # uniq + sort
+  printf '%s\n' $_if_list | tr ' ' '\n' | grep -v '^$' | sort -u
+}
+
+# Выбор интерфейса: 1 шт — без запроса; несколько — меню; 0 — conf / ввод
+# Результат в CHECK_IFACE (не stdout — иначе info попадает в $(...))
+pick_check_iface() {
+  CHECK_IFACE=""
+  conf_iface=$(get_usque_iface)
+  info "IFACE из конфига: ${conf_iface} (${CONF_FILE})"
+
+  avail=$(list_check_ifaces)
+  if [ -n "$conf_iface" ]; then
+    if ip link show "$conf_iface" >/dev/null 2>&1 || [ -e "/sys/class/net/$conf_iface" ]; then
+      if ! printf '%s\n' "$avail" | grep -qxF "$conf_iface"; then
+        avail=$(printf '%s\n%s\n' "$conf_iface" "$avail" | grep -v '^$' | sort -u)
+      fi
+    fi
   fi
 
-  if ip link show "$iface" >/dev/null 2>&1 || ifconfig "$iface" >/dev/null 2>&1; then
+  n=$(printf '%s\n' "$avail" | grep -c . 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+
+  if [ "$n" -eq 0 ]; then
+    warn "Не найдено интерфейсов opkgtun*/nwg*/awg*."
+    if [ -n "$conf_iface" ]; then
+      info "Берём из конфига: $conf_iface"
+      CHECK_IFACE="$conf_iface"
+      return 0
+    fi
+    printf '%s' "Введите имя интерфейса: "
+    CHECK_IFACE=$(read_choice)
+    echo
+    return 0
+  fi
+
+  if [ "$n" -eq 1 ]; then
+    only=$(printf '%s\n' "$avail" | head -1)
+    info "Доступен один интерфейс: $only — проверяем его"
+    CHECK_IFACE="$only"
+    return 0
+  fi
+
+  echo
+  info "Доступные интерфейсы:"
+  i=1
+  listf="/tmp/usque-ifaces-$$"
+  printf '%s\n' "$avail" > "$listf"
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    mark=""
+    [ "$line" = "$conf_iface" ] && mark=" ${DIM}← usque.conf${NC}"
+    printf '  %s%2d%s)  %s%s\n' "$BOLD" "$i" "$NC" "$line" "$mark"
+    i=$((i + 1))
+  done < "$listf"
+  printf '  %s%2d%s)  %sввести вручную%s\n' "$BOLD" "$i" "$NC" "$DIM" "$NC"
+  echo
+  printf '%s' "${BOLD}Интерфейс [1]: ${NC}"
+  ch=$(read_choice)
+  echo
+  case "$ch" in
+    '') ch=1 ;;
+  esac
+  case "$ch" in
+    *[!0-9]*)
+      warn "Неверный выбор, берём $conf_iface"
+      rm -f "$listf"
+      CHECK_IFACE="$conf_iface"
+      return 0
+      ;;
+  esac
+  if [ "$ch" -eq "$i" ]; then
+    printf '%s' "Имя интерфейса: "
+    CHECK_IFACE=$(read_choice)
+    echo
+    rm -f "$listf"
+    return 0
+  fi
+  if [ "$ch" -ge 1 ] && [ "$ch" -lt "$i" ]; then
+    CHECK_IFACE=$(sed -n "${ch}p" "$listf")
+    rm -f "$listf"
+    return 0
+  fi
+  rm -f "$listf"
+  warn "Неверный номер, берём $conf_iface"
+  CHECK_IFACE="$conf_iface"
+}
+
+is_opkgtun_iface() {
+  case "$1" in
+    opkgtun*|OpkgTun*|OPKGTUN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+do_check_iface() {
+  echo
+  info "Проверка интерфейса"
+  pick_check_iface
+  iface="$CHECK_IFACE"
+  if [ -z "$iface" ]; then
+    error "Интерфейс не выбран."
+    return 1
+  fi
+  info "Проверяем: $iface"
+
+  # usque нужен только для opkgtun*
+  if is_opkgtun_iface "$iface"; then
+    if ! is_usque_running; then
+      error "Сервис usque не запущен (нужен для $iface)."
+      echo "  Запуск: $INIT_SCRIPT start"
+      if confirm_yes "Запустить сервис сейчас?"; then
+        if [ -x "$INIT_SCRIPT" ]; then
+          "$INIT_SCRIPT" start 2>&1 || true
+          sleep 2
+        fi
+        if ! is_usque_running; then
+          error "Сервис так и не запустился."
+          return 1
+        fi
+        info "Сервис: запущен"
+      else
+        return 1
+      fi
+    else
+      info "Сервис usque: запущен"
+    fi
+  else
+    info "Интерфейс $iface (не opkgtun) — сервис usque не требуется"
+  fi
+
+  if ip link show "$iface" >/dev/null 2>&1 || [ -e "/sys/class/net/$iface" ] || ifconfig "$iface" >/dev/null 2>&1; then
     info "Интерфейс $iface: есть в системе"
   else
     warn "Интерфейс $iface не найден (ip link / ifconfig)."
@@ -1075,7 +1203,6 @@ do_check_iface() {
   run_iface_probes "$iface"
   ok=$_probe_ok
   echo
-  # Cloudflare colo / WARP trace
   show_cf_trace "$iface" || true
   echo
   if [ "$ok" -ge 2 ]; then
@@ -1083,12 +1210,13 @@ do_check_iface() {
     return 0
   fi
 
-  # процесс жив, но туннель «тухлый» — часто лечится restart
-  warn "Слабый/нулевой ответ через $iface ($ok/3). Туннель мог «залипнуть»."
-  if [ -x "$INIT_SCRIPT" ] && confirm_yes "Перезапустить usque и проверить снова?"; then
+  warn "Слабый/нулевой ответ через $iface ($ok/3)."
+  # restart usque только если проверяли opkgtun
+  if is_opkgtun_iface "$iface" && [ -x "$INIT_SCRIPT" ] && confirm_yes "Перезапустить usque и проверить снова?"; then
     info "Restart..."
     "$INIT_SCRIPT" restart 2>&1 || {
       "$INIT_SCRIPT" stop 2>/dev/null || true
+      sleep 1
       "$INIT_SCRIPT" start 2>&1 || true
     }
     sleep 2
