@@ -1133,48 +1133,65 @@ rci_id_to_linux() {
   esac
 }
 
-# Один проход RCI: linux-имена с "global": true (только true)
-# stdout: nwg0\nnwg1\n...
+# Один проход RCI: "linux|description" для global: true
+# description может быть пустым
 list_global_linux_ifaces() {
   rci_fetch_interfaces || return 1
-  # объекты { ... } → строки; только с global: true; берём "id"
   printf '%s' "$RCI_IFACE_JSON" | tr '\n' ' ' | tr '{' '\n' | \
   grep -E '"global"[[:space:]]*:[[:space:]]*true' | while IFS= read -r block || [ -n "$block" ]; do
-    # id первого уровня объекта
     rid=$(printf '%s' "$block" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
     [ -n "$rid" ] || continue
-    # пропускаем вложенные port/id без смысла для vpn
     case "$rid" in
-      */*) continue ;;  # GigabitEthernet0/0 и т.п.
+      */*) continue ;;
     esac
     linux=$(rci_id_to_linux "$rid")
     [ -n "$linux" ] || continue
-    printf '%s\n' "$linux"
-  done | sort -u
+    desc=$(printf '%s' "$block" | sed -n 's/.*"description"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    # пустой description — только имя
+    if [ -n "$desc" ]; then
+      printf '%s|%s\n' "$linux" "$desc"
+    else
+      printf '%s|\n' "$linux"
+    fi
+  done | sort -t'|' -k1,1 -u
 }
 
-# Кандидаты: opkgtun*/nwg*/awg* ∩ global:true (быстро, один RCI)
+# lookup description by linux name from globals list (name|desc lines)
+iface_desc_of() {
+  ifc="$1"
+  list="$2"
+  printf '%s\n' "$list" | awk -F'|' -v n="$ifc" '$1==n {print $2; exit}'
+}
+
+# Кандидаты: opkgtun*/nwg*/awg* ∩ global:true
+# stdout: linux  или  linux|description
 list_check_ifaces() {
   rm -f /tmp/usque-if-skip-$$
   cands=$(list_candidate_ifaces)
   [ -n "$cands" ] || return 0
 
   globals=$(list_global_linux_ifaces 2>/dev/null) || globals=""
-  if [ -z "$globals" ]; then
-    if [ -z "$RCI_IFACE_JSON" ]; then
-      warn "RCI show/interface недоступен"
-      printf '%s\n' "$cands" | while IFS= read -r ifc || [ -n "$ifc" ]; do
-        [ -n "$ifc" ] || continue
-        printf 'SKIP %s no-rci\n' "$ifc" >> /tmp/usque-if-skip-$$
-      done
-      return 0
-    fi
+  if [ -z "$globals" ] && [ -z "$RCI_IFACE_JSON" ]; then
+    warn "RCI show/interface недоступен"
+    printf '%s\n' "$cands" | while IFS= read -r ifc || [ -n "$ifc" ]; do
+      [ -n "$ifc" ] || continue
+      printf 'SKIP %s no-rci\n' "$ifc" >> /tmp/usque-if-skip-$$
+    done
+    return 0
   fi
+
+  # имена из globals (до |)
+  gnames=$(printf '%s\n' "$globals" | awk -F'|' '{print $1}')
 
   printf '%s\n' "$cands" | while IFS= read -r ifc || [ -n "$ifc" ]; do
     [ -n "$ifc" ] || continue
-    if printf '%s\n' "$globals" | grep -qxF "$ifc"; then
-      printf '%s\n' "$ifc"
+    if printf '%s\n' "$gnames" | grep -qxF "$ifc"; then
+      desc=$(iface_desc_of "$ifc" "$globals")
+      if [ -n "$desc" ]; then
+        printf '%s|%s\n' "$ifc" "$desc"
+      else
+        printf '%s|\n' "$ifc"
+      fi
     else
       printf 'SKIP %s no-global\n' "$ifc" >> /tmp/usque-if-skip-$$
     fi
@@ -1190,9 +1207,9 @@ pick_check_iface() {
 
   info "Поиск интерфейсов opkgtun*/nwg*/awg* с global: true..."
   rm -f /tmp/usque-if-skip-$$
-  avail_raw=$(list_check_ifaces)
-  # имя интерфейса — первое поле (второе может быть global/default)
-  avail=$(printf '%s\n' "$avail_raw" | awk '{print $1}' | grep -v '^$' | sort -u)
+    avail_raw=$(list_check_ifaces)
+  # формат: name|description
+  avail=$(printf '%s\n' "$avail_raw" | awk -F'|' '{print $1}' | grep -v '^$' | sort -u)
   # показать отброшенные
   if [ -f /tmp/usque-if-skip-$$ ]; then
     while IFS= read -r line || [ -n "$line" ]; do
@@ -1230,7 +1247,12 @@ pick_check_iface() {
 
   if [ "$n" -eq 1 ]; then
     only=$(printf '%s\n' "$avail" | head -1)
-    info "Один подходящий интерфейс: $only — проверяем его"
+    only_desc=$(printf '%s\n' "$avail_raw" | awk -F'|' -v n="$only" '$1==n {print $2; exit}')
+    if [ -n "$only_desc" ]; then
+      info "Один подходящий интерфейс: $only ($only_desc) — проверяем"
+    else
+      info "Один подходящий интерфейс: $only — проверяем"
+    fi
     CHECK_IFACE="$only"
     return 0
   fi
@@ -1244,7 +1266,10 @@ pick_check_iface() {
     [ -n "$line" ] || continue
     mark=""
     [ "$line" = "$conf_iface" ] && mark=" ${DIM}← usque.conf${NC}"
-    printf '  %s%2d%s)  %s%s\n' "$BOLD" "$i" "$NC" "$line" "$mark"
+    desc=$(printf '%s\n' "$avail_raw" | awk -F'|' -v n="$line" '$1==n {print $2; exit}')
+    label="$line"
+    [ -n "$desc" ] && label="$line ($desc)"
+    printf '  %s%2d%s)  %s%s\n' "$BOLD" "$i" "$NC" "$label" "$mark"
     i=$((i + 1))
   done < "$listf"
   printf '  %s%2d%s)  %sввести вручную%s\n' "$BOLD" "$i" "$NC" "$DIM" "$NC"
