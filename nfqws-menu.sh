@@ -599,7 +599,7 @@ file_sha256() {
 
 # Скачать/обновить кэш SHA256SUMS (TTL ~1ч). Не фатально при ошибке сети.
 ensure_blobs_sha256sums() {
-  local ttl=3600 now age
+  local ttl=3600 now age tmp
   now=$(date +%s 2>/dev/null || echo 0)
   if [ -f "$BLOBS_SHA256SUMS_CACHE" ] && [ -s "$BLOBS_SHA256SUMS_CACHE" ]; then
     # mtime кэша
@@ -616,9 +616,11 @@ ensure_blobs_sha256sums() {
       return 0
     fi
   fi
-  if download_file "$BLOBS_SHA256SUMS_URL" "$BLOBS_SHA256SUMS_CACHE"; then
+  tmp="${BLOBS_SHA256SUMS_CACHE}.tmp.$$"
+  if download_file "$BLOBS_SHA256SUMS_URL" "$tmp" && [ -s "$tmp" ] && mv -f "$tmp" "$BLOBS_SHA256SUMS_CACHE"; then
     return 0
   fi
+  rm -f "$tmp"
   # старый кэш лучше, чем ничего
   [ -s "$BLOBS_SHA256SUMS_CACHE" ] && return 0
   return 1
@@ -1787,7 +1789,7 @@ REPO_SHA256SUMS_URL="${RAW_BASE}/SHA256SUMS"
 REPO_SHA256SUMS_CACHE="/tmp/nfqws-repo-SHA256SUMS"
 
 ensure_repo_sha256sums() {
-  local ttl=3600 now age
+  local ttl=3600 now age tmp
   now=$(date +%s 2>/dev/null || echo 0)
   if [ -f "$REPO_SHA256SUMS_CACHE" ] && [ -s "$REPO_SHA256SUMS_CACHE" ]; then
     if age=$(stat -c %Y "$REPO_SHA256SUMS_CACHE" 2>/dev/null); then
@@ -1798,9 +1800,11 @@ ensure_repo_sha256sums() {
       return 0
     fi
   fi
-  if download_file "$REPO_SHA256SUMS_URL" "$REPO_SHA256SUMS_CACHE"; then
+  tmp="${REPO_SHA256SUMS_CACHE}.tmp.$$"
+  if download_file "$REPO_SHA256SUMS_URL" "$tmp" && [ -s "$tmp" ] && mv -f "$tmp" "$REPO_SHA256SUMS_CACHE"; then
     return 0
   fi
+  rm -f "$tmp"
   [ -s "$REPO_SHA256SUMS_CACHE" ] && return 0
   return 1
 }
